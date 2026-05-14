@@ -53,18 +53,22 @@ USAR_OLLAMA = os.getenv("USAR_OLLAMA", "false").lower() in ("1", "true", "sim", 
 OLLAMA_TIMEOUT_S = float(os.getenv("OLLAMA_TIMEOUT_S", "5"))
 
 PESQUISAS_PADRAO = [
-    "engenheiro de inteligencia artificial",
-    "engenheiro de IA",
-    "AI engineer",
+    "analista de TI",
+    "analista de sistemas",
+    "analista de infraestrutura",
+    "analista de infraestrutura TI",
+    "analista de suporte TI",
+    "analista cloud",
+    "analista devops",
+    "analista de IA",
+    "analista de inteligencia artificial",
+    "analista de automacao",
+    "analista de seguranca da informacao",
+    "analista cyber security",
+    "desenvolvedor python",
+    "desenvolvedor de sistemas",
     "infraestrutura de TI",
-    "analista de infraestrutura cloud",
-    "cloud engineer",
-    "AWS cloud engineer",
-    "Azure cloud engineer",
-    "devops",
-    "python developer",
-    "cyber security",
-    "seguranca da informacao",
+    "cloud computing",
 ]
 
 AUTO_ENVIAR_CANDIDATURA = True
@@ -957,7 +961,7 @@ class AgenteLinkedIn:
         if not self._page:
             return
         campos = await self._page.locator(
-            "input:not([type='hidden']):not([type='submit']):not([type='button']), textarea"
+            "input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='radio']):not([type='checkbox']):not([type='file']), textarea"
         ).all()
         for campo in campos:
             try:
@@ -968,7 +972,12 @@ class AgenteLinkedIn:
                 aria = (await campo.get_attribute("aria-label")) or ""
                 name = (await campo.get_attribute("name")) or ""
                 tipo = (await campo.get_attribute("type")) or ""
-                ctx = f"{placeholder} {aria} {name}".lower()
+                contexto_visual = await self._contexto_do_campo(campo)
+                ctx = self._normalizar_texto(f"{placeholder} {aria} {name} {contexto_visual}")
+                resposta = self._resposta_para_contexto(ctx)
+                if resposta:
+                    await campo.fill(str(resposta))
+                    continue
                 if any(k in ctx for k in ["telefone", "phone", "celular"]):
                     tel = self.perfil.get("telefone")
                     if tel:
@@ -993,18 +1002,143 @@ class AgenteLinkedIn:
                     continue
             except Exception:
                 continue
+        await self._preencher_selects()
+        await self._preencher_dropdowns_customizados()
+
+    async def _contexto_do_campo(self, campo) -> str:
+        try:
+            return await campo.evaluate(
+                """
+                (el) => {
+                    const bits = [];
+                    const id = el.getAttribute('id');
+                    if (id) {
+                        document.querySelectorAll(`label[for="${CSS.escape(id)}"]`).forEach(label => {
+                            bits.push(label.innerText || label.textContent || '');
+                        });
+                    }
+                    let node = el;
+                    for (let i = 0; i < 4 && node; i++) {
+                        bits.push(node.innerText || node.textContent || '');
+                        node = node.parentElement;
+                    }
+                    return bits.join(' ').slice(0, 1200);
+                }
+                """
+            )
+        except Exception:
+            return ""
+
+    def _valor_perfil(self, *chaves, padrao=""):
+        for chave in chaves:
+            valor = self.perfil.get(chave)
+            if valor not in (None, ""):
+                return valor
+        return padrao
+
+    def _resposta_para_contexto(self, ctx: str):
+        if not ctx:
+            return None
+        if any(k in ctx for k in ["pretensao", "pretencao", "pretensao salarial", "salary", "remuneration", "remuneracao"]):
+            if any(k in ctx for k in ["pj", "cooperado", "contractor", "prestador"]):
+                return self._valor_perfil("pretensao_salarial_pj", padrao=8500)
+            return self._valor_perfil("pretensao_salarial_clt", "pretensao_salarial", padrao=8000)
+        if any(k in ctx for k in ["ingles", "english"]):
+            if any(k in ctx for k in ["c1", "avancado", "advanced", "conversation", "conversacao"]):
+                return "Yes" if self.perfil.get("ingles_avancado", True) else "No"
+            return self._valor_perfil("nivel_ingles", padrao="Advanced")
+        if any(k in ctx for k in ["portfolio", "site", "website", "url"]):
+            return self._valor_perfil("site", "portfolio", padrao="https://www.lstechia.com.br/")
+        if "linkedin" in ctx:
+            return self._valor_perfil("linkedin", padrao=LINKEDIN_PERFIL_URL)
+        if "github" in ctx:
+            return self._valor_perfil("github", padrao="")
+        if any(k in ctx for k in ["disponibilidade", "availability", "inicio", "start date"]):
+            return self._valor_perfil("disponibilidade", padrao="Imediata")
+        if any(k in ctx for k in ["modelo de trabalho", "work model", "remoto", "remote", "hibrido", "hybrid"]):
+            return self._valor_perfil("modelo_trabalho", padrao="Remoto, hibrido ou presencial")
+        if any(k in ctx for k in ["anos", "years", "experiencia", "experience"]):
+            return self._valor_perfil("anos_experiencia", padrao=12)
+        if any(k in ctx for k in ["cidade", "city", "localizacao", "location"]):
+            return self._valor_perfil("cidade", padrao="Brasilia")
+        return None
+
+    def _opcao_para_contexto(self, ctx: str, opcoes: list[str]) -> Optional[str]:
+        if not opcoes:
+            return None
+        normalizadas = [(opcao, self._normalizar_texto(opcao)) for opcao in opcoes if self._normalizar_texto(opcao)]
+        if not normalizadas:
+            return None
+        if any(k in ctx for k in ["ingles", "english", "autorizado", "authorized", "possui", "tem experiencia", "eligible"]):
+            preferidas = ["yes", "sim", "avancado", "advanced", "c1"]
+        elif any(k in ctx for k in ["nivel", "level"]):
+            preferidas = ["avancado", "advanced", "senior", "pleno"]
+        else:
+            preferidas = ["yes", "sim", "aceito", "concordo"]
+        for alvo in preferidas:
+            for original, normalizada in normalizadas:
+                if alvo in normalizada:
+                    return original
+        for original, normalizada in normalizadas:
+            if normalizada not in ("selecionar opcao", "select an option", "selecione", "select"):
+                return original
+        return None
+
+    async def _preencher_selects(self) -> None:
         try:
             selects = await self._page.locator("select").all()
             for s in selects:
                 try:
                     opcoes = await s.locator("option").all_text_contents()
-                    preferida = None
-                    for opt in opcoes:
-                        if opt.strip().lower() in ("sim", "yes"):
-                            preferida = opt
-                            break
+                    ctx = self._normalizar_texto(await self._contexto_do_campo(s))
+                    preferida = self._opcao_para_contexto(ctx, opcoes)
                     if preferida:
                         await s.select_option(label=preferida)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    async def _preencher_dropdowns_customizados(self) -> None:
+        if not self._page:
+            return
+        try:
+            modal = self._page.locator(".jobs-easy-apply-modal, [role='dialog'], .artdeco-modal").last
+            botoes = modal.locator("button, [role='button']")
+            count = min(await botoes.count(), 60)
+            for i in range(count):
+                botao = botoes.nth(i)
+                try:
+                    if not await botao.is_visible(timeout=400):
+                        continue
+                    rotulo = self._normalizar_texto(
+                        f"{await botao.inner_text() or ''} {await botao.get_attribute('aria-label') or ''}"
+                    )
+                    if not any(k in rotulo for k in ["selecionar opcao", "select an option", "selecionar", "select"]):
+                        continue
+                    ctx = self._normalizar_texto(await self._contexto_do_campo(botao))
+                    await self._click_assistido(botao, "dropdown de pergunta", timeout=4000)
+                    await asyncio.sleep(0.25)
+                    opcoes = self._page.locator("[role='option'], .artdeco-dropdown__item, li")
+                    total = min(await opcoes.count(), 30)
+                    textos = []
+                    itens = []
+                    for j in range(total):
+                        item = opcoes.nth(j)
+                        try:
+                            if await item.is_visible(timeout=300):
+                                texto = await item.inner_text()
+                                if texto:
+                                    textos.append(texto)
+                                    itens.append(item)
+                        except Exception:
+                            continue
+                    escolhida = self._opcao_para_contexto(ctx, textos)
+                    if escolhida:
+                        for texto, item in zip(textos, itens):
+                            if texto == escolhida:
+                                await self._click_assistido(item, f"opcao {escolhida}", timeout=4000)
+                                break
                 except Exception:
                     continue
         except Exception:
@@ -1013,10 +1147,11 @@ class AgenteLinkedIn:
     def _texto_apresentacao(self) -> str:
         return (
             f"Ola, meu nome e {self.perfil.get('nome', 'Seu Nome')}. "
-            "Atuo com infraestrutura de TI, redes, servidores Windows e Linux, "
-            "virtualizacao, cloud (AWS/Azure), cyber seguranca, automacao em Python "
-            "e inteligencia artificial. Tenho forte interesse na oportunidade por "
-            "estar diretamente alinhada a minha trajetoria."
+            "Atuo com infraestrutura de TI, sistemas, redes, servidores Windows e Linux, "
+            "virtualizacao, backup, cloud AWS/Azure, ciberseguranca, automacao em Python "
+            "e inteligencia artificial. Pela LS TECHIA, desenvolvo sistemas web, CRMs, "
+            "agentes de IA, automacoes e solucoes de infraestrutura em producao. "
+            "Tenho forte interesse na oportunidade por estar alinhada a minha trajetoria."
         )
 
     async def _fechar_modal(self) -> None:

@@ -10,6 +10,7 @@ Painel local para operar um agente assistido de candidaturas no LinkedIn, com Fa
 - Modo assistido com destaque visual, pausa e cursor `LS`
 - Integração opcional com Ollama para avaliar compatibilidade
 - Seleção automática de currículo por tipo de vaga
+- Preenchimento contextual de perguntas adicionais, como salario, ingles, portfolio e disponibilidade
 - Perfil do Chrome isolado para manter login localmente
 
 ## Configuracao
