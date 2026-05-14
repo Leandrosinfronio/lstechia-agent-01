@@ -11,6 +11,7 @@ import os
 import random
 import subprocess
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -571,6 +572,12 @@ class AgenteLinkedIn:
             return None
         return None
 
+    @staticmethod
+    def _normalizar_texto(texto: str) -> str:
+        texto = unicodedata.normalize("NFKD", texto or "")
+        texto = "".join(c for c in texto if not unicodedata.combining(c))
+        return texto.lower().strip()
+
     async def executar(self) -> None:
         self.estado.rodando = True
         self.estado.parando = False
@@ -771,28 +778,29 @@ class AgenteLinkedIn:
                 await self._preencher_campos_modal()
                 await self._selecionar_curriculo(texto_vaga, tipo_vaga)
                 await asyncio.sleep(0.35)
-                texto = await self._page.locator("body").inner_text()
-                if "Enviar candidatura" in texto or "Submit application" in texto:
+                enviar_visivel = await self._botao_modal_por_texto(
+                    ["Enviar candidatura", "Submit application", "Enviar"]
+                )
+                if enviar_visivel is not None:
                     if not AUTO_ENVIAR_CANDIDATURA:
                         await self._fechar_modal()
                         return False
-                    enviar = self._page.locator(
-                        "button:has-text('Enviar candidatura'), "
-                        "button:has-text('Submit application')"
-                    )
-                    enviar_visivel = await self._primeiro_visivel(enviar)
-                    if enviar_visivel is not None:
-                        if not await self._click_assistido(enviar_visivel, "botao Enviar candidatura", timeout=8000):
-                            return False
-                        await self._sleep_jitter((1, 2))
-                        await self._fechar_modal()
-                        return True
-                revisar = self._page.locator(
-                    "button:has-text('Revisar'), button:has-text('Review')"
-                )
-                revisar_visivel = await self._primeiro_visivel(revisar)
+                    if not await self._click_assistido(enviar_visivel, "botao Enviar candidatura", timeout=8000):
+                        return False
+                    await self._sleep_jitter((1, 2))
+                    await self._fechar_modal()
+                    return True
+                revisar_visivel = await self._botao_modal_por_texto(["Revisar", "Review"])
                 if revisar_visivel is not None:
                     if not await self._click_assistido(revisar_visivel, "botao Revisar", timeout=8000):
+                        return False
+                    await self._sleep_jitter((0.7, 1.4))
+                    continue
+                proximo_rapido = await self._botao_modal_por_texto(
+                    ["Avan\u00e7ar", "Avancar", "Pr\u00f3ximo", "Proximo", "Next", "Continuar", "Continue"]
+                )
+                if proximo_rapido is not None:
+                    if not await self._click_assistido(proximo_rapido, "botao Proximo", timeout=8000):
                         return False
                     await self._sleep_jitter((0.7, 1.4))
                     continue
@@ -821,6 +829,51 @@ class AgenteLinkedIn:
             self.log(f"AVISO: erro durante candidatura: {e}")
             await self._fechar_modal()
             return False
+
+    async def _rolar_modal_para_baixo(self) -> None:
+        if not self._page:
+            return
+        try:
+            await self._page.evaluate(
+                """
+                () => {
+                    const modal = document.querySelector('.jobs-easy-apply-modal, [role="dialog"], .artdeco-modal');
+                    const body = modal?.querySelector('.jobs-easy-apply-modal__content, .artdeco-modal__content');
+                    if (body) body.scrollTop = body.scrollHeight;
+                    else modal?.scrollTo?.(0, modal.scrollHeight);
+                }
+                """
+            )
+            await self._pausa_visual(0.2)
+        except Exception:
+            pass
+
+    async def _botao_modal_por_texto(self, textos: list[str]):
+        if not self._page:
+            return None
+        await self._rolar_modal_para_baixo()
+        alvos = [self._normalizar_texto(t) for t in textos]
+        try:
+            modal = self._page.locator(".jobs-easy-apply-modal, [role='dialog'], .artdeco-modal").last
+            botoes = modal.locator("button")
+            count = min(await botoes.count(), 40)
+            for i in range(count):
+                botao = botoes.nth(i)
+                try:
+                    texto = self._normalizar_texto(await botao.inner_text() or "")
+                    aria = self._normalizar_texto(await botao.get_attribute("aria-label") or "")
+                    rotulo = f"{texto} {aria}"
+                    if not any(alvo and alvo in rotulo for alvo in alvos):
+                        continue
+                    if await botao.is_disabled(timeout=500):
+                        continue
+                    await self._rolar_modal_ate_botao(botao)
+                    return botao
+                except Exception:
+                    continue
+        except Exception:
+            return None
+        return None
 
     async def _rolar_modal_ate_botao(self, locator) -> None:
         try:
