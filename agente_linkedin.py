@@ -833,6 +833,7 @@ class AgenteLinkedIn:
             erros_consecutivos = 0
             _etapa_hash_anterior = ""
             _etapas_travadas = 0
+            _revisar_consecutivo = 0
             for _etapa in range(1, MAX_ETAPAS_CANDIDATURA + 1):
                 if self.stop_event.is_set():
                     return False
@@ -853,10 +854,18 @@ class AgenteLinkedIn:
                     return True
                 revisar_visivel = await self._botao_modal_por_texto(["Revisar", "Review"])
                 if revisar_visivel is not None:
+                    _revisar_consecutivo += 1
+                    if _revisar_consecutivo >= 5:
+                        self.log("AVISO: loop em Revisar (5x). Descartando vaga.")
+                        await self._fechar_modal()
+                        return False
+                    # Tenta preencher campos pendentes antes de clicar Revisar
+                    await self._preencher_campos_modal()
                     if not await self._click_assistido(revisar_visivel, "botao Revisar", timeout=8000):
                         return False
                     await self._sleep_jitter((0.7, 1.4))
                     continue
+                _revisar_consecutivo = 0
                 proximo_btn = await self._botao_modal_por_texto(
                     ["Avançar", "Avancar", "Próximo", "Proximo", "Next", "Continuar", "Continue"]
                 )
@@ -1234,8 +1243,26 @@ class AgenteLinkedIn:
                     await campo.fill(self.perfil.get("cidade", "Brasília"))
                     await self._selecionar_autocomplete_cidade()
                     continue
-                if any(k in ctx for k in ["anos", "years", "experiencia", "experience"]):
-                    await campo.fill(str(self.perfil.get("anos_experiencia", 12)))
+                # Pergunta de nível com opções numéricas (SAP/ERP) — responde 3 = Básico
+                if any(k in ctx for k in ["sap", "erp", "benner", "alvo", "totvs", "protheus"]) and \
+                        any(k in ctx for k in ["numero da opcao", "numero", "avancado", "intermediario", "basico", "opcao"]):
+                    await campo.fill("3")
+                    continue
+                if any(k in ctx for k in ["anos", "years", "experiencia", "experience",
+                                           "tempo", "how long", "quanto tempo", "trabalha com",
+                                           "usa o", "usa a", "use the", "using"]):
+                    tecnologias_fora = ["sap", "erp", "benner", "alvo", "totvs", "protheus",
+                                        "rh", "financeiro", "fiscal", "controladoria"]
+                    # Tecnologias de DEV que o usuário tem conhecimento básico
+                    tecnologias_dev = ["node", "react", "angular", "vue", "java ", "php",
+                                       "ruby", "golang", "go ", "kotlin", "swift", ".net"]
+                    if any(k in ctx for k in tecnologias_fora):
+                        continue  # Não preencher para techs totalmente fora do perfil
+                    anos = self.perfil.get("anos_experiencia", 12)
+                    if any(k in ctx for k in tecnologias_dev):
+                        await campo.fill("1")  # Básico para dev fora do foco principal
+                    else:
+                        await campo.fill(str(anos))
                     continue
                 if any(k in ctx for k in ["salario", "salary", "pretensao", "remuneration"]):
                     salario = self.perfil.get("pretensao_salarial")
@@ -1330,7 +1357,16 @@ class AgenteLinkedIn:
             return self._valor_perfil("modelo_trabalho", padrao="Remoto, hibrido ou presencial")
         if any(k in ctx for k in ["headline", "titulo profissional", "professional headline", "cargo atual", "job title"]):
             return self._valor_perfil("titulo_profissional", padrao="Analista de TI | Infraestrutura | IA | Cloud | DevOps | Python")
-        if any(k in ctx for k in ["anos", "years", "experiencia", "experience"]):
+        if any(k in ctx for k in ["anos", "years", "experiencia", "experience",
+                                    "tempo", "how long", "quanto tempo", "trabalha com"]):
+            tecnologias_fora = ["sap", "erp", "benner", "alvo", "totvs", "protheus",
+                                 "rh", "financeiro", "fiscal", "controladoria"]
+            tecnologias_dev = ["node", "react", "angular", "vue", "java ", "php",
+                                "ruby", "golang", "go ", "kotlin", "swift", ".net"]
+            if any(k in ctx for k in tecnologias_fora):
+                return None
+            if any(k in ctx for k in tecnologias_dev):
+                return "1"
             return self._valor_perfil("anos_experiencia", padrao=12)
         if any(k in ctx for k in ["cidade", "city", "localizacao", "location"]):
             return self._valor_perfil("cidade", padrao="Brasília")
@@ -1380,6 +1416,15 @@ class AgenteLinkedIn:
         elif any(k in ctx for k in ["worked for", "ever worked", "previously employed", "worked at"]):
             preferidas = ["no", "nao", "não"]
             exige_preferida = True
+        elif any(k in ctx for k in ["ma conectividade", "ma internet", "problema de internet",
+                                        "conexao ruim", "dificuldade de conexao"]):
+            preferidas = ["nao", "não", "no"]
+            exige_preferida = True
+        elif any(k in ctx for k in ["rh", "recursos humanos", "financeiro", "fiscal",
+                                        "controladoria", "contabil", "folha de pagamento",
+                                        "sap business", "s/4hana", "s4hana", "business one"]):
+            preferidas = ["nao", "não", "no"]
+            exige_preferida = True
         elif any(k in ctx for k in ["possui", "experiencia", "experience", "tem conhecimento", "conhecimento", "atuou", "trabalhou"]):
             preferidas = ["sim", "yes", "si", "tenho", "possuo"]
             exige_preferida = True
@@ -1417,13 +1462,37 @@ class AgenteLinkedIn:
         try:
             modal = self._modal_locator()
             selects = await modal.locator("select").all()
+            if selects:
+                self.log(f"Preenchendo {len(selects)} select(s) no modal...")
             for s in selects:
                 try:
-                    opcoes = await s.locator("option").all_text_contents()
+                    # Pula se já tem valor selecionado
+                    atual = await s.input_value()
+                    if atual and atual not in ("", "null", "undefined"):
+                        continue
+                    # Usa JS para ler opções — mais confiável que locator("option")
+                    opcoes_raw = await s.evaluate(
+                        "el => Array.from(el.options).map(o => o.text.trim())"
+                    )
+                    opcoes = [o for o in opcoes_raw if o]
+                    if not opcoes:
+                        continue
                     ctx = self._normalizar_texto(await self._contexto_do_campo(s))
                     preferida = self._opcao_para_contexto(ctx, opcoes)
                     if preferida:
-                        await s.select_option(label=preferida)
+                        self.log(f"Select [{ctx[:40]}] → '{preferida}'")
+                        try:
+                            await s.select_option(label=preferida)
+                        except Exception:
+                            await s.evaluate(
+                                """(el, val) => {
+                                    const opt = Array.from(el.options).find(o => o.text.trim() === val);
+                                    if (opt) { el.value = opt.value; el.dispatchEvent(new Event('change', {bubbles:true})); }
+                                }""",
+                                preferida
+                            )
+                    else:
+                        self.log(f"Select [{ctx[:40]}] sem opcao compativel. Opcoes: {opcoes[:5]}")
                 except Exception:
                     continue
         except Exception:
@@ -1466,12 +1535,15 @@ class AgenteLinkedIn:
                         continue
                     ctx = self._normalizar_texto(contexto_botao)
                     await self._click_assistido(botao, "dropdown de pergunta", timeout=4000)
-                    await asyncio.sleep(0.4)
+                    await asyncio.sleep(0.8)
                     opcoes = self._page.locator(
                         "[role='listbox'] [role='option'], "
                         ".artdeco-dropdown__content--is-open [role='option'], "
                         ".artdeco-dropdown__content--is-open .artdeco-dropdown__item, "
                         "ul.artdeco-dropdown__content li[role='option'], "
+                        "[role='option']:visible, "
+                        "li[data-test-form-builder-select-options], "
+                        ".fb-form-element__dropdown-option, "
                         ".artdeco-typeahead__results-list li"
                     )
                     total = min(await opcoes.count(), 30)
