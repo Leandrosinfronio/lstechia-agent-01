@@ -1077,21 +1077,43 @@ class AgenteLinkedIn:
     def _opcao_para_contexto(self, ctx: str, opcoes: list[str]) -> Optional[str]:
         if not opcoes:
             return None
-        normalizadas = [(opcao, self._normalizar_texto(opcao)) for opcao in opcoes if self._normalizar_texto(opcao)]
+        ignorar = (
+            "candidatura simplificada",
+            "easy apply",
+            "vagas",
+            "mais recentes",
+            "mais relevante",
+            "remoto",
+            "presencial",
+            "hibrido",
+            "filtro",
+        )
+        normalizadas = [
+            (opcao, self._normalizar_texto(opcao))
+            for opcao in opcoes
+            if self._normalizar_texto(opcao)
+            and not any(bloqueado in self._normalizar_texto(opcao) for bloqueado in ignorar)
+        ]
         if not normalizadas:
             return None
+        exige_preferida = False
         if any(k in ctx for k in ["possui", "experiencia", "experience", "tem conhecimento", "conhecimento", "atuou", "trabalhou"]):
-            preferidas = ["sim", "yes", "tenho", "possuo"]
+            preferidas = ["sim", "yes", "si", "tenho", "possuo"]
+            exige_preferida = True
         elif any(k in ctx for k in ["ingles", "english", "spoken english", "autorizado", "authorized", "eligible"]):
             preferidas = ["yes", "sim", "si", "avancado", "advanced", "c1", "c2"]
+            exige_preferida = True
         elif any(k in ctx for k in ["nivel", "level"]):
             preferidas = ["avancado", "advanced", "senior", "pleno"]
+            exige_preferida = True
         else:
             preferidas = ["yes", "sim", "aceito", "concordo"]
         for alvo in preferidas:
             for original, normalizada in normalizadas:
                 if alvo in normalizada:
                     return original
+        if exige_preferida:
+            return None
         for original, normalizada in normalizadas:
             if normalizada not in ("selecionar opcao", "selecciona una opcion", "select an option", "selecione", "select"):
                 return original
