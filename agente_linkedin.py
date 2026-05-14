@@ -976,7 +976,7 @@ class AgenteLinkedIn:
                 ctx = self._normalizar_texto(f"{placeholder} {aria} {name} {contexto_visual}")
                 resposta = self._resposta_para_contexto(ctx)
                 if resposta:
-                    await campo.fill(str(resposta))
+                    await campo.fill(self._formatar_resposta_para_campo(resposta, tipo, ctx))
                     continue
                 if any(k in ctx for k in ["telefone", "phone", "celular"]):
                     tel = self.perfil.get("telefone")
@@ -1036,6 +1036,15 @@ class AgenteLinkedIn:
                 return valor
         return padrao
 
+    def _formatar_resposta_para_campo(self, resposta, tipo: str, ctx: str) -> str:
+        if any(k in ctx for k in ["pretensao", "pretencao", "salary", "remuneration", "remuneracao"]):
+            try:
+                valor = float(str(resposta).replace(",", "."))
+                return f"{valor:.1f}"
+            except Exception:
+                return str(resposta)
+        return str(resposta)
+
     def _resposta_para_contexto(self, ctx: str):
         if not ctx:
             return None
@@ -1069,7 +1078,9 @@ class AgenteLinkedIn:
         normalizadas = [(opcao, self._normalizar_texto(opcao)) for opcao in opcoes if self._normalizar_texto(opcao)]
         if not normalizadas:
             return None
-        if any(k in ctx for k in ["ingles", "english", "autorizado", "authorized", "possui", "tem experiencia", "eligible"]):
+        if any(k in ctx for k in ["possui", "experiencia", "experience", "tem conhecimento", "conhecimento", "atuou", "trabalhou"]):
+            preferidas = ["sim", "yes", "tenho", "possuo"]
+        elif any(k in ctx for k in ["ingles", "english", "autorizado", "authorized", "eligible"]):
             preferidas = ["yes", "sim", "avancado", "advanced", "c1"]
         elif any(k in ctx for k in ["nivel", "level"]):
             preferidas = ["avancado", "advanced", "senior", "pleno"]
@@ -1111,12 +1122,16 @@ class AgenteLinkedIn:
                 try:
                     if not await botao.is_visible(timeout=400):
                         continue
+                    contexto_botao = await self._contexto_do_campo(botao)
                     rotulo = self._normalizar_texto(
-                        f"{await botao.inner_text() or ''} {await botao.get_attribute('aria-label') or ''}"
+                        f"{await botao.inner_text() or ''} "
+                        f"{await botao.get_attribute('aria-label') or ''} "
+                        f"{await botao.get_attribute('aria-haspopup') or ''} "
+                        f"{contexto_botao}"
                     )
-                    if not any(k in rotulo for k in ["selecionar opcao", "select an option", "selecionar", "select"]):
+                    if not any(k in rotulo for k in ["selecionar opcao", "select an option", "selecionar", "select", "listbox"]):
                         continue
-                    ctx = self._normalizar_texto(await self._contexto_do_campo(botao))
+                    ctx = self._normalizar_texto(contexto_botao)
                     await self._click_assistido(botao, "dropdown de pergunta", timeout=4000)
                     await asyncio.sleep(0.25)
                     opcoes = self._page.locator("[role='option'], .artdeco-dropdown__item, li")
