@@ -1,4 +1,4 @@
-"""
+﻿"""
 LS.IA Agent 01 - Nucleo do Agente LinkedIn
 Versao: 2.0
 """
@@ -51,6 +51,12 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 USAR_OLLAMA = os.getenv("USAR_OLLAMA", "false").lower() in ("1", "true", "sim", "yes")
 OLLAMA_TIMEOUT_S = float(os.getenv("OLLAMA_TIMEOUT_S", "5"))
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+USAR_GROQ = os.getenv("USAR_GROQ", "false").lower() in ("1", "true", "sim", "yes")
+GROQ_TIMEOUT_S = float(os.getenv("GROQ_TIMEOUT_S", "8"))
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 PESQUISAS_PADRAO = [
     "analista de TI",
@@ -129,6 +135,7 @@ class EstadoAgente:
     ultima_atividade: Optional[str] = None
     pesquisa_atual: Optional[str] = None
     vagas_aplicadas: set = field(default_factory=set)
+    vagas_tentadas: set = field(default_factory=set)
 
     def snapshot(self) -> dict:
         return {
@@ -682,7 +689,7 @@ class AgenteLinkedIn:
                 if not link:
                     continue
                 chave = link.split("?")[0]
-                if chave in self.estado.vagas_aplicadas:
+                if chave in self.estado.vagas_aplicadas or chave in self.estado.vagas_tentadas:
                     continue
                 if not await self._click_assistido(vaga, "card da vaga", timeout=8000):
                     continue
@@ -697,12 +704,14 @@ class AgenteLinkedIn:
                     continue
                 self.log(f"Vaga compativel ({tipo_vaga}). Iniciando candidatura...")
                 enviou = await self._tentar_candidatar(texto, tipo_vaga)
+                self.estado.vagas_tentadas.add(chave)
                 if enviou:
                     self.estado.candidaturas_enviadas += 1
                     self.estado.vagas_aplicadas.add(chave)
                     self._salvar_vagas_aplicadas()
                     self.log(f"Candidatura ENVIADA. Total nesta sessao: {self.estado.candidaturas_enviadas}")
                 else:
+                    self.log(f"Vaga ignorada nesta sessao: {chave}")
                     await self._fechar_modal()
                 await self._sleep_jitter(ESPERA_ENTRE_VAGAS_S)
             except Exception as e:
@@ -737,14 +746,8 @@ class AgenteLinkedIn:
             return "infraestrutura"
         return "geral"
 
-    async def _ia_diz_compativel(self, texto_vaga: str, tipo_vaga: str) -> bool:
-        if self._fallback_heuristico(texto_vaga, tipo_vaga):
-            if not USAR_OLLAMA:
-                return True
-        else:
-            return False
-
-        prompt = (
+    def _prompt_ia(self, texto_vaga: str) -> str:
+        return (
             "Voce e um filtro de match de curriculo. Responda APENAS no formato:\n"
             "DECISAO: COMPATIVEL\nMOTIVO: <frase curta>\n"
             "ou\n"
@@ -752,20 +755,55 @@ class AgenteLinkedIn:
             f"PERFIL:\n{json.dumps(self.perfil, ensure_ascii=False)}\n\n"
             f"VAGA:\n{texto_vaga[:4500]}\n"
         )
+
+    @staticmethod
+    def _avaliar_resposta_ia(resposta: str) -> bool:
+        decisao = resposta.upper()
+        if "NAO_COMPATIVEL" in decisao or "NAO COMPATIVEL" in decisao:
+            return False
+        return "COMPATIVEL" in decisao
+
+    async def _ia_groq(self, texto_vaga: str) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=GROQ_TIMEOUT_S) as client:
+                r = await client.post(
+                    GROQ_URL,
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "model": GROQ_MODEL,
+                        "messages": [{"role": "user", "content": self._prompt_ia(texto_vaga)}],
+                        "max_tokens": 100,
+                        "temperature": 0,
+                    },
+                )
+                resposta = r.json()["choices"][0]["message"]["content"]
+                self.log(f"Groq ({GROQ_MODEL}): {resposta[:80]}")
+                return self._avaliar_resposta_ia(resposta)
+        except Exception as e:
+            self.log(f"AVISO: Groq indisponivel ({e}). Aprovado pela heuristica.")
+            return True
+
+    async def _ia_diz_compativel(self, texto_vaga: str, tipo_vaga: str) -> bool:
+        if not self._fallback_heuristico(texto_vaga, tipo_vaga):
+            return False
+
+        if USAR_GROQ and GROQ_API_KEY:
+            return await self._ia_groq(texto_vaga)
+
+        if not USAR_OLLAMA:
+            return True
+
         try:
             async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_S) as client:
                 r = await client.post(
                     OLLAMA_URL,
-                    json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+                    json={"model": OLLAMA_MODEL, "prompt": self._prompt_ia(texto_vaga), "stream": False},
                 )
                 resposta = r.json().get("response", "")
         except Exception as e:
             self.log(f"AVISO: Ollama indisponivel ({e}). Aprovado pela heuristica rapida.")
             return True
-        decisao = resposta.upper()
-        if "NAO_COMPATIVEL" in decisao or "NAO COMPATIVEL" in decisao:
-            return False
-        return "COMPATIVEL" in decisao
+        return self._avaliar_resposta_ia(resposta)
 
     def _fallback_heuristico(self, texto_vaga: str, tipo_vaga: str = "geral") -> bool:
         t = texto_vaga.lower()
@@ -792,6 +830,9 @@ class AgenteLinkedIn:
             if not await self._click_assistido(botao_visivel, "botao Candidatura simplificada", timeout=8000):
                 return False
             await self._sleep_jitter((0.7, 1.4))
+            erros_consecutivos = 0
+            _etapa_hash_anterior = ""
+            _etapas_travadas = 0
             for _etapa in range(1, MAX_ETAPAS_CANDIDATURA + 1):
                 if self.stop_event.is_set():
                     return False
@@ -816,30 +857,57 @@ class AgenteLinkedIn:
                         return False
                     await self._sleep_jitter((0.7, 1.4))
                     continue
-                proximo_rapido = await self._botao_modal_por_texto(
-                    ["Avan\u00e7ar", "Avancar", "Pr\u00f3ximo", "Proximo", "Next", "Continuar", "Continue"]
+                proximo_btn = await self._botao_modal_por_texto(
+                    ["Avançar", "Avancar", "Próximo", "Proximo", "Next", "Continuar", "Continue"]
                 )
-                if proximo_rapido is not None:
-                    if not await self._click_assistido(proximo_rapido, "botao Proximo", timeout=8000):
+                if proximo_btn is None:
+                    proximo_loc = self._page.locator(
+                        "button:has-text('Avançar'), button:has-text('Próximo'), "
+                        "button:has-text('Next'), button[aria-label*='Next']"
+                    )
+                    proximo_vis = await self._primeiro_visivel(proximo_loc)
+                    if proximo_vis is not None:
+                        await self._rolar_modal_ate_botao(proximo_vis)
+                        proximo_btn = proximo_vis
+                if proximo_btn is not None:
+                    # Captura hash da etapa atual antes de avançar
+                    try:
+                        _hash_antes = (await self._modal_locator().inner_text())[:200]
+                    except Exception:
+                        _hash_antes = ""
+                    if not await self._click_assistido(proximo_btn, "botao Proximo", timeout=8000):
                         return False
                     await self._sleep_jitter((0.7, 1.4))
-                    continue
-                proximo = self._page.locator(
-                    "button:has-text('Avançar'), "
-                    "button:has-text('Avancar'), "
-                    "button:has-text('Próximo'), "
-                    "button:has-text('Proximo'), "
-                    "button:has-text('Next'), "
-                    "button[aria-label*='Avançar'], "
-                    "button[aria-label*='Próximo'], "
-                    "button[aria-label*='Next']"
-                )
-                proximo_visivel = await self._primeiro_visivel(proximo)
-                if proximo_visivel is not None:
-                    await self._rolar_modal_ate_botao(proximo_visivel)
-                    if not await self._click_assistido(proximo_visivel, "botao Proximo", timeout=8000):
-                        return False
-                    await self._sleep_jitter((0.7, 1.4))
+                    # Detecta etapa travada (conteúdo idêntico ao anterior)
+                    try:
+                        _hash_depois = (await self._modal_locator().inner_text())[:200]
+                    except Exception:
+                        _hash_depois = ""
+                    if _hash_antes and _hash_depois and _hash_antes == _hash_depois:
+                        _etapas_travadas += 1
+                        self.log(f"AVISO: etapa nao avancou ({_etapas_travadas}/2). Tentando preencher novamente...")
+                        if _etapas_travadas >= 2:
+                            self.log("AVISO: etapa travada 2x. Descartando vaga.")
+                            await self._fechar_modal()
+                            return False
+                        await self._preencher_campos_modal()
+                        await self._selecionar_curriculo(texto_vaga, tipo_vaga)
+                        continue
+                    else:
+                        _etapas_travadas = 0
+                        _etapa_hash_anterior = _hash_depois
+                    if await self._tem_erros_validacao():
+                        erros_consecutivos += 1
+                        self.log(f"AVISO: campo obrigatorio vazio (tentativa {erros_consecutivos}/3). Tentando preencher...")
+                        if erros_consecutivos >= 3:
+                            self.log("AVISO: 3 erros consecutivos. Descartando vaga.")
+                            await self._fechar_modal()
+                            return False
+                        await asyncio.sleep(0.5)
+                        await self._preencher_campos_modal()
+                        await self._selecionar_curriculo(texto_vaga, tipo_vaga)
+                    else:
+                        erros_consecutivos = 0
                     continue
                 await self._fechar_modal()
                 return False
@@ -872,21 +940,22 @@ class AgenteLinkedIn:
         if not self._page:
             return None
         await self._rolar_modal_para_baixo()
-        alvos = [self._normalizar_texto(t) for t in textos]
         try:
-            modal = self._page.locator(".jobs-easy-apply-modal, [role='dialog'], .artdeco-modal").last
-            botoes = modal.locator("button")
-            count = min(await botoes.count(), 40)
-            for i in range(count):
-                botao = botoes.nth(i)
+            modal = self._modal_locator()
+            for texto in textos:
+                seletor = f"button:has-text('{texto}')"
                 try:
-                    texto = self._normalizar_texto(await botao.inner_text() or "")
-                    aria = self._normalizar_texto(await botao.get_attribute("aria-label") or "")
-                    rotulo = f"{texto} {aria}"
-                    if not any(alvo and alvo in rotulo for alvo in alvos):
+                    loc = modal.locator(seletor)
+                    if await loc.count() == 0:
                         continue
-                    if await botao.is_disabled(timeout=500):
+                    botao = await self._primeiro_visivel(loc, limite=5)
+                    if botao is None:
                         continue
+                    try:
+                        if await botao.is_disabled(timeout=300):
+                            continue
+                    except Exception:
+                        pass
                     await self._rolar_modal_ate_botao(botao)
                     return botao
                 except Exception:
@@ -961,18 +1030,184 @@ class AgenteLinkedIn:
                 except Exception:
                     continue
             if melhor is not None and melhor_pontos > 0:
-                await self._rolar_modal_ate_botao(melhor)
-                if await self._click_assistido(melhor, f"curriculo {tipo_vaga}", timeout=5000):
-                    self.log(f"Curriculo escolhido para vaga {tipo_vaga}: {melhor_texto}")
+                # Não clicar se o rádio já está marcado
+                ja_selecionado = False
+                try:
+                    radio = melhor.locator("input[type='radio']").first
+                    if await radio.count() > 0:
+                        ja_selecionado = await radio.is_checked()
+                except Exception:
+                    pass
+                if not ja_selecionado:
+                    await self._rolar_modal_ate_botao(melhor)
+                    # Tenta clicar diretamente no input radio; fallback no elemento pai
+                    clicou = False
+                    try:
+                        radio_direct = melhor.locator("input[type='radio']").first
+                        if await radio_direct.count() > 0:
+                            await radio_direct.dispatch_event("click")
+                            clicou = True
+                    except Exception:
+                        pass
+                    if not clicou:
+                        clicou = await self._click_assistido(melhor, f"curriculo {tipo_vaga}", timeout=5000)
+                    if clicou:
+                        self.log(f"Curriculo escolhido para vaga {tipo_vaga}: {melhor_texto}")
         except Exception as e:
             self.log(f"AVISO: nao consegui escolher curriculo automaticamente: {e}")
+
+    def _resposta_radio(self, ctx: str) -> Optional[str]:
+        """Retorna 'yes' ou 'no' para perguntas de radio button baseado no contexto."""
+        if any(k in ctx for k in ["sponsor", "patrocin", "immigration", "visa sponsorship", "visa transfer"]):
+            return "no"
+        if any(k in ctx for k in ["authorized", "autorizado", "lawfully", "eligible work", "work authorization"]):
+            return "yes"
+        if any(k in ctx for k in ["non-compete", "non-solicit"]):
+            return "no"
+        if any(k in ctx for k in ["ever worked for", "worked for", "previously employed", "affiliated compan"]):
+            return "no"
+        if any(k in ctx for k in ["ever interviewed", "interviewed with", "previously interviewed"]):
+            return "no"
+        if any(k in ctx for k in ["certify", "i certify", "acknowledge", "i agree", "i understand",
+                                   "lie detector", "misdemeanor", "background investigation",
+                                   "complete and accurate", "duly authorized"]):
+            return "yes"
+        return None
+
+    async def _preencher_radio_buttons(self) -> None:
+        if not self._page:
+            return
+        try:
+            modal = self._modal_locator()
+            radios = modal.locator("input[type='radio']")
+            count = min(await radios.count(), 50)
+            processados: set = set()
+            for i in range(count):
+                radio = radios.nth(i)
+                try:
+                    name = await radio.get_attribute("name") or f"_anon_{i}"
+                    if name in processados:
+                        continue
+                    processados.add(name)
+                    ctx = self._normalizar_texto(await radio.evaluate("""
+                        (el) => {
+                            const c = el.closest('fieldset') || el.closest('[role="group"]')
+                                   || el.closest('.form-group') || el.closest('.field')
+                                   || el.parentElement?.parentElement?.parentElement;
+                            return (c?.innerText || el.parentElement?.parentElement?.innerText || '').slice(0, 600);
+                        }
+                    """))
+                    resposta = self._resposta_radio(ctx)
+                    if resposta is None:
+                        continue
+                    nome_escaped = name.replace("'", "\\'")
+                    grupo = modal.locator(f"input[type='radio'][name='{nome_escaped}']")
+                    g_count = min(await grupo.count(), 6)
+                    for j in range(g_count):
+                        r = grupo.nth(j)
+                        try:
+                            label_texto = self._normalizar_texto(await r.evaluate("""
+                                (el) => {
+                                    const id = el.id;
+                                    if (id) {
+                                        const lbl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+                                        if (lbl) return lbl.innerText;
+                                    }
+                                    return el.closest('label')?.innerText || el.value || '';
+                                }
+                            """))
+                            if resposta in label_texto:
+                                try:
+                                    if await r.is_checked(timeout=300):
+                                        break
+                                except Exception:
+                                    pass
+                                await self._click_assistido(r, f"radio '{label_texto}'", timeout=3000)
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    async def _tem_erros_validacao(self) -> bool:
+        if not self._page:
+            return False
+        try:
+            modal = self._modal_locator()
+            count = await modal.locator(
+                ".artdeco-inline-feedback--error, "
+                "[data-test-inline-feedback='error'], "
+                ".error-message, p.error, span.error, "
+                ".field-error, .validation-error, "
+                "[class*='error']:not(script)"
+            ).count()
+            if count > 0:
+                return True
+            try:
+                texto = (await modal.inner_text(timeout=2000) or "").lower()
+            except Exception:
+                texto = ""
+            return any(t in texto for t in [
+                "please enter a valid", "please make a selection",
+                "este campo é obrigatório", "campo obrigatório",
+                "required field", "invalid answer", "preencha este campo",
+                "fill in this field", "this field is required",
+                "por favor selecione", "selecione uma opcao",
+            ])
+        except Exception:
+            return False
+
+    async def _selecionar_autocomplete_cidade(self) -> None:
+        if not self._page:
+            return
+        try:
+            await asyncio.sleep(0.5)
+            sugestoes = self._page.locator(
+                ".basic-typeahead__triggered-content li, "
+                ".artdeco-typeahead__results-list li"
+            )
+            count = await sugestoes.count()
+            if count == 0:
+                return
+            cidade_norm = self._normalizar_texto(self.perfil.get("cidade", "brasilia"))
+            prefer = self._normalizar_texto(self.perfil.get("cidade_autocomplete_prefer", "distrito federal"))
+            preferido = None
+            for i in range(min(count, 8)):
+                item = sugestoes.nth(i)
+                try:
+                    texto = self._normalizar_texto(await item.inner_text())
+                    if prefer in texto and cidade_norm in texto:
+                        preferido = item
+                        break
+                    if preferido is None and cidade_norm in texto:
+                        preferido = item
+                except Exception:
+                    continue
+            if preferido is not None:
+                await self._click_assistido(preferido, "sugestao de cidade", timeout=3000)
+        except Exception:
+            pass
+
+    def _modal_locator(self):
+        return self._page.locator(
+            ".jobs-easy-apply-modal, "
+            "div[role='dialog'][aria-modal='true'], "
+            ".artdeco-modal--layer-default"
+        ).last
 
     async def _preencher_campos_modal(self) -> None:
         if not self._page:
             return
-        campos = await self._page.locator(
-            "input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='radio']):not([type='checkbox']):not([type='file']), textarea"
-        ).all()
+        try:
+            modal = self._modal_locator()
+            campos = await modal.locator(
+                "input:not([type='hidden']):not([type='submit']):not([type='button'])"
+                ":not([type='radio']):not([type='checkbox']):not([type='file']), textarea"
+            ).all()
+        except Exception:
+            return
         for campo in campos:
             try:
                 valor = await campo.input_value()
@@ -987,14 +1222,17 @@ class AgenteLinkedIn:
                 resposta = self._resposta_para_contexto(ctx)
                 if resposta:
                     await campo.fill(self._formatar_resposta_para_campo(resposta, tipo, ctx))
+                    if any(k in ctx for k in ["cidade", "city", "location", "localizacao"]):
+                        await self._selecionar_autocomplete_cidade()
                     continue
                 if any(k in ctx for k in ["telefone", "phone", "celular"]):
                     tel = self.perfil.get("telefone")
                     if tel:
                         await campo.fill(str(tel))
                     continue
-                if any(k in ctx for k in ["cidade", "city"]):
-                    await campo.fill(self.perfil.get("cidade", "Brasilia"))
+                if any(k in ctx for k in ["cidade", "city", "location", "localizacao"]):
+                    await campo.fill(self.perfil.get("cidade", "Brasília"))
+                    await self._selecionar_autocomplete_cidade()
                     continue
                 if any(k in ctx for k in ["anos", "years", "experiencia", "experience"]):
                     await campo.fill(str(self.perfil.get("anos_experiencia", 12)))
@@ -1004,8 +1242,19 @@ class AgenteLinkedIn:
                     if salario:
                         await campo.fill(str(salario))
                     continue
-                if any(k in ctx for k in ["mensagem", "cover", "resumo", "carta"]):
-                    await campo.fill(self._texto_apresentacao())
+                if any(k in ctx for k in ["headline", "titulo profissional", "professional headline", "cargo atual", "job title"]):
+                    await campo.fill(self.perfil.get("titulo_profissional", "Analista de TI | Infraestrutura | IA | Cloud | DevOps | Python"))
+                    continue
+                if any(k in ctx for k in ["summary", "sobre voce", "about you", "professional summary", "resumo profissional"]):
+                    await campo.fill(self.perfil.get("resumo", ""))
+                    continue
+                if any(k in ctx for k in ["mensagem", "cover letter", "cover", "carta", "carta de apresentacao"]):
+                    valor_atual = await campo.input_value() or ""
+                    template_markers = ["bigdatacorp", "company name", "[company]", "estagiar na", "vejo na"]
+                    eh_template = any(m in valor_atual.lower() for m in template_markers)
+                    if not valor_atual or eh_template:
+                        await campo.clear()
+                        await campo.fill(self._texto_apresentacao())
                     continue
                 if tipo in ("text", "email") and any(k in ctx for k in ["nome", "name"]):
                     await campo.fill(self.perfil.get("nome", "Seu Nome"))
@@ -1014,6 +1263,7 @@ class AgenteLinkedIn:
                 continue
         await self._preencher_selects()
         await self._preencher_dropdowns_customizados()
+        await self._preencher_radio_buttons()
 
     async def _contexto_do_campo(self, campo) -> str:
         try:
@@ -1078,10 +1328,21 @@ class AgenteLinkedIn:
             return self._valor_perfil("disponibilidade", padrao="Imediata")
         if any(k in ctx for k in ["modelo de trabalho", "work model", "remoto", "remote", "hibrido", "hybrid"]):
             return self._valor_perfil("modelo_trabalho", padrao="Remoto, hibrido ou presencial")
+        if any(k in ctx for k in ["headline", "titulo profissional", "professional headline", "cargo atual", "job title"]):
+            return self._valor_perfil("titulo_profissional", padrao="Analista de TI | Infraestrutura | IA | Cloud | DevOps | Python")
         if any(k in ctx for k in ["anos", "years", "experiencia", "experience"]):
             return self._valor_perfil("anos_experiencia", padrao=12)
         if any(k in ctx for k in ["cidade", "city", "localizacao", "location"]):
-            return self._valor_perfil("cidade", padrao="Brasilia")
+            return self._valor_perfil("cidade", padrao="Brasília")
+        if any(k in ctx for k in ["street address", "endereco", "address line 1", "address 1", "rua", "logradouro"]):
+            if not any(k in ctx for k in ["2", "second", "line 2", "address 2"]):
+                return self._valor_perfil("endereco_rua", padrao="SQN 302 Bloco E Apt 301")
+        if any(k in ctx for k in ["state", "estado", "province", "provincia"]):
+            return self._valor_perfil("endereco_estado", padrao="DF")
+        if any(k in ctx for k in ["zip", "postal", "cep", "codigo postal"]):
+            return self._valor_perfil("endereco_cep", padrao="70737-050")
+        if any(k in ctx for k in ["country", "pais", "país"]):
+            return self._valor_perfil("endereco_pais", padrao="Brazil")
         return None
 
     def _opcao_para_contexto(self, ctx: str, opcoes: list[str]) -> Optional[str]:
@@ -1110,10 +1371,19 @@ class AgenteLinkedIn:
         if self._pergunta_sobre_tecnologia_fora_do_perfil(ctx):
             preferidas = ["nao", "não", "no", "no tengo", "no possuo"]
             exige_preferida = True
+        elif any(k in ctx for k in ["non-compete", "non-solicit", "nao compete", "nao concorr"]):
+            preferidas = ["no", "nao", "não"]
+            exige_preferida = True
+        elif any(k in ctx for k in ["sponsor", "patrocin", "immigration", "visa sponsorship"]):
+            preferidas = ["no", "nao", "não"]
+            exige_preferida = True
+        elif any(k in ctx for k in ["worked for", "ever worked", "previously employed", "worked at"]):
+            preferidas = ["no", "nao", "não"]
+            exige_preferida = True
         elif any(k in ctx for k in ["possui", "experiencia", "experience", "tem conhecimento", "conhecimento", "atuou", "trabalhou"]):
             preferidas = ["sim", "yes", "si", "tenho", "possuo"]
             exige_preferida = True
-        elif any(k in ctx for k in ["ingles", "english", "spoken english", "autorizado", "authorized", "eligible"]):
+        elif any(k in ctx for k in ["ingles", "english", "spoken english", "autorizado", "authorized", "eligible", "lawfully"]):
             preferidas = ["yes", "sim", "si", "avancado", "advanced", "c1", "c2"]
             exige_preferida = True
         elif any(k in ctx for k in ["nivel", "level"]):
@@ -1145,7 +1415,8 @@ class AgenteLinkedIn:
 
     async def _preencher_selects(self) -> None:
         try:
-            selects = await self._page.locator("select").all()
+            modal = self._modal_locator()
+            selects = await modal.locator("select").all()
             for s in selects:
                 try:
                     opcoes = await s.locator("option").all_text_contents()
@@ -1162,27 +1433,47 @@ class AgenteLinkedIn:
         if not self._page:
             return
         try:
-            modal = self._page.locator(".jobs-easy-apply-modal, [role='dialog'], .artdeco-modal").last
+            modal = self._modal_locator()
             botoes = modal.locator("button, [role='button']")
-            count = min(await botoes.count(), 60)
+            count = min(await botoes.count(), 30)
             for i in range(count):
                 botao = botoes.nth(i)
                 try:
-                    if not await botao.is_visible(timeout=400):
+                    if not await botao.is_visible(timeout=200):
+                        continue
+                    texto_botao = await botao.inner_text() or ""
+                    texto_botao_norm = self._normalizar_texto(texto_botao)
+                    aria_botao = await botao.get_attribute("aria-label") or ""
+                    aria_botao_norm = self._normalizar_texto(aria_botao)
+                    placeholder_dropdown = (
+                        "selecionar opcao",
+                        "selecciona una opcion",
+                        "select an option",
+                        "selecione uma opcao",
+                    )
+                    if not any(p in texto_botao_norm for p in placeholder_dropdown):
                         continue
                     contexto_botao = await self._contexto_do_campo(botao)
                     rotulo = self._normalizar_texto(
-                        f"{await botao.inner_text() or ''} "
-                        f"{await botao.get_attribute('aria-label') or ''} "
+                        f"{texto_botao} "
+                        f"{aria_botao} "
                         f"{await botao.get_attribute('aria-haspopup') or ''} "
                         f"{contexto_botao}"
                     )
-                    if not any(k in rotulo for k in ["selecionar opcao", "selecciona una opcion", "select an option", "selecionar", "select", "listbox"]):
+                    if not any(k in rotulo for k in placeholder_dropdown):
+                        continue
+                    if any(k in aria_botao_norm for k in ["email", "e-mail", "codigo do pais", "country code"]):
                         continue
                     ctx = self._normalizar_texto(contexto_botao)
                     await self._click_assistido(botao, "dropdown de pergunta", timeout=4000)
-                    await asyncio.sleep(0.25)
-                    opcoes = self._page.locator("[role='option'], .artdeco-dropdown__item, li")
+                    await asyncio.sleep(0.4)
+                    opcoes = self._page.locator(
+                        "[role='listbox'] [role='option'], "
+                        ".artdeco-dropdown__content--is-open [role='option'], "
+                        ".artdeco-dropdown__content--is-open .artdeco-dropdown__item, "
+                        "ul.artdeco-dropdown__content li[role='option'], "
+                        ".artdeco-typeahead__results-list li"
+                    )
                     total = min(await opcoes.count(), 30)
                     textos = []
                     itens = []
