@@ -46,6 +46,8 @@ CDP_URL = f"http://{CDP_HOST}:{CDP_PORT}"
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+USAR_OLLAMA = os.getenv("USAR_OLLAMA", "false").lower() in ("1", "true", "sim", "yes")
+OLLAMA_TIMEOUT_S = float(os.getenv("OLLAMA_TIMEOUT_S", "5"))
 
 PESQUISAS_PADRAO = [
     "engenheiro de inteligencia artificial",
@@ -64,14 +66,28 @@ PESQUISAS_PADRAO = [
 
 AUTO_ENVIAR_CANDIDATURA = True
 MODO_ASSISTIDO = True  # destaque visual + traz Chrome pra frente
-DELAY_VISUAL_ASSISTIDO_S = 1.2
+DELAY_VISUAL_ASSISTIDO_S = float(os.getenv("DELAY_VISUAL_ASSISTIDO_S", "0.45"))
 CURSOR_VISUAL_ID = "lsia-agent-cursor"
 CURSOR_PULSE_ID = "lsia-agent-cursor-pulse"
 MAX_VAGAS_POR_CICLO = 25
 MAX_ETAPAS_CANDIDATURA = 10
-ESPERA_ENTRE_CICLOS_S = (45, 90)
-ESPERA_ENTRE_VAGAS_S = (6, 14)
-ESPERA_ENTRE_BUSCAS_S = (8, 18)
+ESPERA_ENTRE_CICLOS_S = (20, 35)
+ESPERA_ENTRE_VAGAS_S = (1.5, 3.5)
+ESPERA_ENTRE_BUSCAS_S = (3, 6)
+
+TIPOS_DE_VAGA = {
+    "ia": [
+        "ia", "ai", "artificial intelligence", "inteligencia artificial",
+        "machine learning", "ml", "llm", "genai", "dados", "data",
+        "python", "automacao", "automation",
+    ],
+    "infraestrutura": [
+        "infraestrutura", "infrastructure", "cloud", "aws", "azure",
+        "devops", "linux", "windows server", "redes", "network",
+        "servidor", "server", "seguranca", "security", "cyber",
+        "suporte", "sre", "sysadmin",
+    ],
+}
 
 
 def _agora() -> str:
@@ -290,11 +306,11 @@ class AgenteLinkedIn:
     async def _sleep_jitter(self, intervalo) -> None:
         baixo, alto = intervalo
         total = random.uniform(baixo, alto)
-        passos = max(1, int(total))
+        passos = max(1, int(total / 0.25))
         for _ in range(passos):
             if self.stop_event.is_set():
                 return
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.25)
 
     async def _fechar_popups(self) -> int:
         if not self._page:
@@ -531,7 +547,10 @@ class AgenteLinkedIn:
             await locator.wait_for(state="visible", timeout=timeout)
             await self._destacar(locator)
             self.log(f"Acao assistida: clicando em {descricao}.")
-            await locator.click(timeout=timeout)
+            try:
+                await locator.click(timeout=timeout)
+            except Exception:
+                await locator.evaluate("(el) => el.click()")
             await self._pausa_visual(0.8)
             return True
         except Exception as e:
@@ -643,16 +662,17 @@ class AgenteLinkedIn:
                     continue
                 if not await self._click_assistido(vaga, "card da vaga", timeout=8000):
                     continue
-                await self._sleep_jitter((3, 6))
+                await self._sleep_jitter((1, 2))
                 await self._fechar_popups()
                 self.estado.vagas_analisadas += 1
                 texto = await self._page.locator("body").inner_text()
                 if not self._tem_candidatura_simplificada(texto):
                     continue
-                if not await self._ia_diz_compativel(texto):
+                tipo_vaga = self._tipo_de_vaga(texto)
+                if not await self._ia_diz_compativel(texto, tipo_vaga):
                     continue
-                self.log("Vaga compativel. Iniciando candidatura...")
-                enviou = await self._tentar_candidatar()
+                self.log(f"Vaga compativel ({tipo_vaga}). Iniciando candidatura...")
+                enviou = await self._tentar_candidatar(texto, tipo_vaga)
                 if enviou:
                     self.estado.candidaturas_enviadas += 1
                     self.estado.vagas_aplicadas.add(chave)
@@ -678,7 +698,25 @@ class AgenteLinkedIn:
         t = texto.lower()
         return "candidatura simplificada" in t or "easy apply" in t
 
-    async def _ia_diz_compativel(self, texto_vaga: str) -> bool:
+    def _tipo_de_vaga(self, texto_vaga: str) -> str:
+        t = texto_vaga.lower()
+        pontos = {
+            tipo: sum(1 for termo in termos if termo in t)
+            for tipo, termos in TIPOS_DE_VAGA.items()
+        }
+        if pontos["ia"] > pontos["infraestrutura"]:
+            return "ia"
+        if pontos["infraestrutura"] > 0:
+            return "infraestrutura"
+        return "geral"
+
+    async def _ia_diz_compativel(self, texto_vaga: str, tipo_vaga: str) -> bool:
+        if self._fallback_heuristico(texto_vaga, tipo_vaga):
+            if not USAR_OLLAMA:
+                return True
+        else:
+            return False
+
         prompt = (
             "Voce e um filtro de match de curriculo. Responda APENAS no formato:\n"
             "DECISAO: COMPATIVEL\nMOTIVO: <frase curta>\n"
@@ -688,31 +726,27 @@ class AgenteLinkedIn:
             f"VAGA:\n{texto_vaga[:4500]}\n"
         )
         try:
-            async with httpx.AsyncClient(timeout=120) as client:
+            async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_S) as client:
                 r = await client.post(
                     OLLAMA_URL,
                     json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
                 )
                 resposta = r.json().get("response", "")
         except Exception as e:
-            self.log(f"AVISO: Ollama indisponivel ({e}). Heuristica aplicada.")
-            return self._fallback_heuristico(texto_vaga)
+            self.log(f"AVISO: Ollama indisponivel ({e}). Aprovado pela heuristica rapida.")
+            return True
         decisao = resposta.upper()
         if "NAO_COMPATIVEL" in decisao or "NAO COMPATIVEL" in decisao:
             return False
         return "COMPATIVEL" in decisao
 
-    def _fallback_heuristico(self, texto_vaga: str) -> bool:
+    def _fallback_heuristico(self, texto_vaga: str, tipo_vaga: str = "geral") -> bool:
         t = texto_vaga.lower()
-        palavras = [
-            "infraestrutura", "infrastructure", "cloud", "aws", "azure",
-            "devops", "python", "linux", "windows server", "cyber",
-            "seguranca", "security", "inteligencia artificial", "ai engineer",
-            "machine learning", "redes", "network",
-        ]
-        return sum(1 for p in palavras if p in t) >= 2
+        palavras = TIPOS_DE_VAGA["ia"] + TIPOS_DE_VAGA["infraestrutura"]
+        minimo = 1 if tipo_vaga in ("ia", "infraestrutura") else 2
+        return sum(1 for p in palavras if p in t) >= minimo
 
-    async def _tentar_candidatar(self) -> bool:
+    async def _tentar_candidatar(self, texto_vaga: str = "", tipo_vaga: str = "geral") -> bool:
         try:
             botao = self._page.locator(
                 ".jobs-search__job-details--container button.jobs-apply-button, "
@@ -730,12 +764,13 @@ class AgenteLinkedIn:
                 return False
             if not await self._click_assistido(botao_visivel, "botao Candidatura simplificada", timeout=8000):
                 return False
-            await self._sleep_jitter((2, 4))
+            await self._sleep_jitter((0.7, 1.4))
             for _etapa in range(1, MAX_ETAPAS_CANDIDATURA + 1):
                 if self.stop_event.is_set():
                     return False
                 await self._preencher_campos_modal()
-                await asyncio.sleep(1)
+                await self._selecionar_curriculo(texto_vaga, tipo_vaga)
+                await asyncio.sleep(0.35)
                 texto = await self._page.locator("body").inner_text()
                 if "Enviar candidatura" in texto or "Submit application" in texto:
                     if not AUTO_ENVIAR_CANDIDATURA:
@@ -749,7 +784,7 @@ class AgenteLinkedIn:
                     if enviar_visivel is not None:
                         if not await self._click_assistido(enviar_visivel, "botao Enviar candidatura", timeout=8000):
                             return False
-                        await self._sleep_jitter((3, 5))
+                        await self._sleep_jitter((1, 2))
                         await self._fechar_modal()
                         return True
                 revisar = self._page.locator(
@@ -759,18 +794,24 @@ class AgenteLinkedIn:
                 if revisar_visivel is not None:
                     if not await self._click_assistido(revisar_visivel, "botao Revisar", timeout=8000):
                         return False
-                    await self._sleep_jitter((2, 4))
+                    await self._sleep_jitter((0.7, 1.4))
                     continue
                 proximo = self._page.locator(
+                    "button:has-text('Avançar'), "
                     "button:has-text('Avancar'), "
+                    "button:has-text('Próximo'), "
                     "button:has-text('Proximo'), "
-                    "button:has-text('Next')"
+                    "button:has-text('Next'), "
+                    "button[aria-label*='Avançar'], "
+                    "button[aria-label*='Próximo'], "
+                    "button[aria-label*='Next']"
                 )
                 proximo_visivel = await self._primeiro_visivel(proximo)
                 if proximo_visivel is not None:
+                    await self._rolar_modal_ate_botao(proximo_visivel)
                     if not await self._click_assistido(proximo_visivel, "botao Proximo", timeout=8000):
                         return False
-                    await self._sleep_jitter((2, 4))
+                    await self._sleep_jitter((0.7, 1.4))
                     continue
                 await self._fechar_modal()
                 return False
@@ -780,6 +821,78 @@ class AgenteLinkedIn:
             self.log(f"AVISO: erro durante candidatura: {e}")
             await self._fechar_modal()
             return False
+
+    async def _rolar_modal_ate_botao(self, locator) -> None:
+        try:
+            await locator.evaluate(
+                """
+                (el) => {
+                    const modal = el.closest('.jobs-easy-apply-modal, [role="dialog"], .artdeco-modal');
+                    const body = modal?.querySelector('.jobs-easy-apply-modal__content, .artdeco-modal__content');
+                    if (body) body.scrollTop = body.scrollHeight;
+                    el.scrollIntoView({ block: 'center', inline: 'center' });
+                }
+                """
+            )
+            await self._pausa_visual(0.25)
+        except Exception:
+            pass
+
+    def _preferencias_curriculo(self, tipo_vaga: str) -> list[str]:
+        curriculos = self.perfil.get("curriculos", {})
+        if isinstance(curriculos, dict):
+            cfg = curriculos.get(tipo_vaga) or curriculos.get("geral")
+            if isinstance(cfg, dict):
+                termos = cfg.get("identificadores") or cfg.get("palavras_chave") or []
+                if isinstance(termos, list) and termos:
+                    return [str(t).lower() for t in termos]
+            if isinstance(cfg, list) and cfg:
+                return [str(t).lower() for t in cfg]
+
+        if tipo_vaga == "ia":
+            return ["analista de ia", "ia", "inteligencia artificial", "inteligência artificial", "ai"]
+        if tipo_vaga == "infraestrutura":
+            return ["analista de infraestrutura", "infraestrutura", "cloud", "devops", "redes"]
+        return ["curriculo", "currículo", "resume"]
+
+    async def _selecionar_curriculo(self, texto_vaga: str, tipo_vaga: str) -> None:
+        if not self._page:
+            return
+        termos = self._preferencias_curriculo(tipo_vaga)
+        try:
+            modal = self._page.locator(".jobs-easy-apply-modal, [role='dialog'], .artdeco-modal").last
+            opcoes = modal.locator(
+                "label, "
+                "div[role='radio'], "
+                "li:has(input[type='radio']), "
+                "div:has(input[type='radio'])"
+            )
+            count = min(await opcoes.count(), 25)
+            melhor = None
+            melhor_texto = ""
+            melhor_pontos = 0
+            for i in range(count):
+                opcao = opcoes.nth(i)
+                try:
+                    if not await opcao.is_visible(timeout=500):
+                        continue
+                    texto = ((await opcao.inner_text()) or "").lower()
+                    if not any(base in texto for base in ["curriculo", "currículo", "resume", ".pdf", ".doc"]):
+                        continue
+                    pontos = sum(1 for termo in termos if termo and termo in texto)
+                    pontos += sum(1 for termo in TIPOS_DE_VAGA.get(tipo_vaga, []) if termo in texto_vaga.lower() and termo in texto)
+                    if pontos > melhor_pontos:
+                        melhor = opcao
+                        melhor_texto = " ".join(texto.split())[:90]
+                        melhor_pontos = pontos
+                except Exception:
+                    continue
+            if melhor is not None and melhor_pontos > 0:
+                await self._rolar_modal_ate_botao(melhor)
+                if await self._click_assistido(melhor, f"curriculo {tipo_vaga}", timeout=5000):
+                    self.log(f"Curriculo escolhido para vaga {tipo_vaga}: {melhor_texto}")
+        except Exception as e:
+            self.log(f"AVISO: nao consegui escolher curriculo automaticamente: {e}")
 
     async def _preencher_campos_modal(self) -> None:
         if not self._page:

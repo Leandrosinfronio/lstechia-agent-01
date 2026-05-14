@@ -18,5 +18,13 @@
     "AWS",
     "Azure",
     "Linux"
-  ]
+  ],
+  "curriculos": {
+    "ia": {
+      "identificadores": ["Analista de IA", "IA", "Inteligencia Artificial", "AI"]
+    },
+    "infraestrutura": {
+      "identificadores": ["Analista de Infraestrutura", "Infraestrutura", "Cloud", "DevOps"]
+    }
+  }
 }
