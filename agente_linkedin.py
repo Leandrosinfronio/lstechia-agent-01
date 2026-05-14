@@ -620,6 +620,7 @@ class AgenteLinkedIn:
             self.estado.erro_atual = str(e)
             self.log(f"ERRO fatal: {e}")
         finally:
+            await self._fechar_modal()
             await self._desconectar_playwright()
             self.estado.rodando = False
             self.estado.parando = False
@@ -676,6 +677,7 @@ class AgenteLinkedIn:
             if self.stop_event.is_set():
                 return
             try:
+                await self._fechar_modal()
                 link = await vaga.get_attribute("href")
                 if not link:
                     continue
@@ -700,9 +702,12 @@ class AgenteLinkedIn:
                     self.estado.vagas_aplicadas.add(chave)
                     self._salvar_vagas_aplicadas()
                     self.log(f"Candidatura ENVIADA. Total nesta sessao: {self.estado.candidaturas_enviadas}")
+                else:
+                    await self._fechar_modal()
                 await self._sleep_jitter(ESPERA_ENTRE_VAGAS_S)
             except Exception as e:
                 self.log(f"AVISO: erro ao processar card: {e}")
+                await self._fechar_modal()
 
     def _url_busca(self, termo: str) -> str:
         from urllib.parse import quote_plus
@@ -1215,25 +1220,45 @@ class AgenteLinkedIn:
     async def _fechar_modal(self) -> None:
         if not self._page:
             return
-        try:
-            fechar = self._page.locator(
-                "button[aria-label='Fechar'], "
-                "button[aria-label='Dismiss'], "
-                "button[aria-label='Close']"
-            )
-            if await fechar.count() > 0:
-                await fechar.first.click()
-                await asyncio.sleep(0.6)
-            descartar = self._page.locator(
-                "button:has-text('Descartar'), "
-                "button:has-text('Discard'), "
-                "button:has-text('Sair mesmo assim')"
-            )
-            if await descartar.count() > 0:
-                await descartar.first.click()
-                await asyncio.sleep(0.6)
-        except Exception:
-            pass
+        for _ in range(5):
+            clicou = False
+            try:
+                descartar = self._page.locator(
+                    "button:has-text('Descartar'), "
+                    "button:has-text('Discard'), "
+                    "button:has-text('Sair mesmo assim'), "
+                    "button:has-text('Leave'), "
+                    "button:has-text('No guardar'), "
+                    "button:has-text('Descartar solicitud')"
+                )
+                botao_descartar = await self._primeiro_visivel(descartar, limite=8)
+                if botao_descartar is not None:
+                    await self._click_assistido(botao_descartar, "botao Descartar", timeout=3000)
+                    await asyncio.sleep(0.5)
+                    clicou = True
+                    continue
+
+                fechar = self._page.locator(
+                    ".jobs-easy-apply-modal button[aria-label='Fechar'], "
+                    ".jobs-easy-apply-modal button[aria-label='Dismiss'], "
+                    ".jobs-easy-apply-modal button[aria-label='Close'], "
+                    ".artdeco-modal button[aria-label='Fechar'], "
+                    ".artdeco-modal button[aria-label='Dismiss'], "
+                    ".artdeco-modal button[aria-label='Close'], "
+                    "[role='dialog'] button[aria-label='Fechar'], "
+                    "[role='dialog'] button[aria-label='Dismiss'], "
+                    "[role='dialog'] button[aria-label='Close']"
+                )
+                botao_fechar = await self._primeiro_visivel(fechar, limite=12)
+                if botao_fechar is not None:
+                    await self._click_assistido(botao_fechar, "X do modal", timeout=3000)
+                    await asyncio.sleep(0.5)
+                    clicou = True
+                    continue
+            except Exception:
+                pass
+            if not clicou:
+                break
 
     def solicitar_parada(self) -> None:
         self.estado.parando = True
