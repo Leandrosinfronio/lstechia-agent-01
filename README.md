@@ -54,6 +54,9 @@ Este repositorio ignora arquivos com dados sensiveis ou locais:
 - `venv`
 - `node_modules`
 
+O arquivo `agent.log` e limitado automaticamente por `LOG_MAX_BYTES` e `LOG_KEEP_LINES`.
+O historico de candidaturas fica separado em `vagas_aplicadas.json` e nao e limpo junto com os logs.
+
 Antes de publicar, confira com:
 
 ```bash

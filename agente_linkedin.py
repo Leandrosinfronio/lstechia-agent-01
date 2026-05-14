@@ -34,6 +34,8 @@ load_dotenv(BASE_DIR / ".env")
 PERFIL_PATH = BASE_DIR / "perfil.json"
 VAGAS_APLICADAS_PATH = BASE_DIR / "vagas_aplicadas.json"
 LOG_FILE = BASE_DIR / "agent.log"
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", "1000000"))
+LOG_KEEP_LINES = int(os.getenv("LOG_KEEP_LINES", "800"))
 
 CHROME_USER_DATA_DIR = os.getenv("CHROME_USER_DATA_DIR", str(BASE_DIR / "chrome_agent_profile_real"))
 CHROME_PROFILE_NAME = os.getenv("CHROME_PROFILE_NAME", "Default")
@@ -99,6 +101,10 @@ def _log_arquivo(msg: str) -> None:
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"[{_agora()}] {msg}\n")
+        if LOG_FILE.stat().st_size > LOG_MAX_BYTES:
+            linhas = LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()
+            ultimas = linhas[-LOG_KEEP_LINES:]
+            LOG_FILE.write_text("\n".join(ultimas) + "\n", encoding="utf-8")
     except Exception:
         pass
 
