@@ -1049,11 +1049,13 @@ class AgenteLinkedIn:
         if not ctx:
             return None
         if any(k in ctx for k in ["pretensao", "pretencao", "pretensao salarial", "salary", "remuneration", "remuneracao"]):
+            if any(k in ctx for k in ["usd", "dollar", "dolar", "monthly salary expectations"]):
+                return self._valor_perfil("pretensao_salarial_usd", "pretensao_salarial_usd_mensal", padrao=1600)
             if any(k in ctx for k in ["pj", "cooperado", "contractor", "prestador"]):
                 return self._valor_perfil("pretensao_salarial_pj", padrao=8500)
             return self._valor_perfil("pretensao_salarial_clt", "pretensao_salarial", padrao=8000)
-        if any(k in ctx for k in ["ingles", "english"]):
-            if any(k in ctx for k in ["c1", "avancado", "advanced", "conversation", "conversacao"]):
+        if any(k in ctx for k in ["ingles", "english", "spoken english"]):
+            if any(k in ctx for k in ["c1", "c2", "avancado", "advanced", "conversation", "conversacao", "spoken"]):
                 return "Yes" if self.perfil.get("ingles_avancado", True) else "No"
             return self._valor_perfil("nivel_ingles", padrao="Advanced")
         if any(k in ctx for k in ["portfolio", "site", "website", "url"]):
@@ -1080,8 +1082,8 @@ class AgenteLinkedIn:
             return None
         if any(k in ctx for k in ["possui", "experiencia", "experience", "tem conhecimento", "conhecimento", "atuou", "trabalhou"]):
             preferidas = ["sim", "yes", "tenho", "possuo"]
-        elif any(k in ctx for k in ["ingles", "english", "autorizado", "authorized", "eligible"]):
-            preferidas = ["yes", "sim", "avancado", "advanced", "c1"]
+        elif any(k in ctx for k in ["ingles", "english", "spoken english", "autorizado", "authorized", "eligible"]):
+            preferidas = ["yes", "sim", "si", "avancado", "advanced", "c1", "c2"]
         elif any(k in ctx for k in ["nivel", "level"]):
             preferidas = ["avancado", "advanced", "senior", "pleno"]
         else:
@@ -1091,7 +1093,7 @@ class AgenteLinkedIn:
                 if alvo in normalizada:
                     return original
         for original, normalizada in normalizadas:
-            if normalizada not in ("selecionar opcao", "select an option", "selecione", "select"):
+            if normalizada not in ("selecionar opcao", "selecciona una opcion", "select an option", "selecione", "select"):
                 return original
         return None
 
@@ -1129,7 +1131,7 @@ class AgenteLinkedIn:
                         f"{await botao.get_attribute('aria-haspopup') or ''} "
                         f"{contexto_botao}"
                     )
-                    if not any(k in rotulo for k in ["selecionar opcao", "select an option", "selecionar", "select", "listbox"]):
+                    if not any(k in rotulo for k in ["selecionar opcao", "selecciona una opcion", "select an option", "selecionar", "select", "listbox"]):
                         continue
                     ctx = self._normalizar_texto(contexto_botao)
                     await self._click_assistido(botao, "dropdown de pergunta", timeout=4000)
