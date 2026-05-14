@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <title>LS.IA Agent 01 - LinkedIn</title>
+  <style>
+    :root {
+      --bg: #020617;
+      --panel: #0f172a;
+      --border: #1e293b;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --green: #22c55e;
+      --red: #ef4444;
+      --orange: #f59e0b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      background: var(--bg); color: var(--text);
+      font-family: 'Segoe UI', Arial, sans-serif;
+      margin: 0; padding: 32px;
+    }
+    .container {
+      max-width: 1080px; margin: auto;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 18px; padding: 28px;
+      box-shadow: 0 0 40px rgba(56, 189, 248, 0.15);
+    }
+    h1 { color: var(--accent); margin: 0 0 4px 0; }
+    .subtitle { color: var(--muted); margin-bottom: 18px; font-size: 14px; }
+    .status-bar {
+      display: flex; gap: 12px; flex-wrap: wrap; align-items: center;
+      background: var(--bg); border: 1px solid #334155;
+      padding: 12px 16px; border-radius: 10px; margin-bottom: 16px;
+    }
+    .dot {
+      width: 12px; height: 12px; border-radius: 50%;
+      background: var(--red); box-shadow: 0 0 8px currentColor;
+    }
+    .dot.on { background: var(--green); }
+    .dot.warn { background: var(--orange); }
+    .status-label { font-weight: bold; }
+    .stats {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 10px; margin-bottom: 16px;
+    }
+    .stat {
+      background: var(--bg); border: 1px solid #334155;
+      border-radius: 10px; padding: 12px 14px;
+    }
+    .stat .k { font-size: 12px; color: var(--muted); }
+    .stat .v {
+      font-size: 22px; font-weight: bold; color: var(--accent);
+      margin-top: 4px; word-break: break-word;
+    }
+    .controls { margin-bottom: 18px; display: flex; flex-wrap: wrap; gap: 10px; }
+    button {
+      padding: 14px 22px; border: none; border-radius: 10px;
+      font-size: 15px; font-weight: 700; cursor: pointer;
+      transition: transform 0.05s ease, opacity 0.15s ease;
+    }
+    button:active { transform: translateY(1px); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-on { background: var(--green); color: white; }
+    .btn-off { background: var(--red); color: white; }
+    .btn-warn { background: var(--orange); color: white; }
+    h2 { color: var(--accent); margin-bottom: 10px; }
+    pre {
+      background: var(--bg); border: 1px solid #334155;
+      border-radius: 12px; padding: 16px;
+      height: 440px; overflow-y: auto; white-space: pre-wrap;
+      color: #d1d5db;
+      font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 13px;
+    }
+    .erro {
+      color: #fca5a5; font-size: 13px;
+      margin-top: 8px; min-height: 16px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>LS.IA Agent 01 - LinkedIn</h1>
+    <div class="subtitle">
+      Agente autonomo: IA, Infraestrutura, Cloud, Cyber Security, DevOps, Python, AWS, Azure.
+    </div>
+
+    <div class="status-bar">
+      <span class="dot" id="dot"></span>
+      <span class="status-label" id="status-label">DESLIGADO</span>
+      <span style="color: var(--muted); margin-left: 8px;" id="pesquisa-atual"></span>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="k">Candidaturas (sessao)</div><div class="v" id="s-cand">0</div></div>
+      <div class="stat"><div class="k">Vagas analisadas</div><div class="v" id="s-anal">0</div></div>
+      <div class="stat"><div class="k">Total ja aplicadas</div><div class="v" id="s-total">0</div></div>
+      <div class="stat"><div class="k">Iniciado em</div><div class="v" id="s-ini" style="font-size:14px;">-</div></div>
+    </div>
+
+    <div class="controls">
+      <button class="btn-on" id="btn-ligar" onclick="ligar()">LIGAR AGENTE</button>
+      <button class="btn-off" id="btn-deslig" onclick="desligar()">DESLIGAR AGENTE</button>
+      <button class="btn-warn" id="btn-forca" onclick="forcar()">FORCAR PARADA</button>
+    </div>
+
+    <div class="erro" id="erro"></div>
+
+    <h2>Logs</h2>
+    <pre id="logs">Aguardando comando...</pre>
+  </div>
+
+  <script>
+    async function ligar()    { setEstadoBotoes('ligando');    try { await fetch('/ligar',         { method: 'POST' }); } catch(e) {} }
+    async function desligar() { setEstadoBotoes('desligando'); try { await fetch('/desligar',      { method: 'POST' }); } catch(e) {} }
+    async function forcar()   { setEstadoBotoes('desligando'); try { await fetch('/forcar-parada', { method: 'POST' }); } catch(e) {} }
+
+    function setEstadoBotoes(modo) {
+      const ligar = document.getElementById('btn-ligar');
+      const desl  = document.getElementById('btn-deslig');
+      const forca = document.getElementById('btn-forca');
+      if (modo === 'ligando')    { ligar.disabled = true;  desl.disabled = false; forca.disabled = false; }
+      if (modo === 'rodando')    { ligar.disabled = true;  desl.disabled = false; forca.disabled = false; }
+      if (modo === 'desligando') { ligar.disabled = true;  desl.disabled = true;  forca.disabled = false; }
+      if (modo === 'parado')     { ligar.disabled = false; desl.disabled = true;  forca.disabled = true;  }
+    }
+
+    async function atualizar() {
+      try {
+        const opts = { cache: 'no-store' };
+        const [logsResp, statusResp] = await Promise.all([fetch('/logs', opts), fetch('/status', opts)]);
+        const logsData = await logsResp.json();
+        const statusData = await statusResp.json();
+        const pre = document.getElementById('logs');
+        pre.textContent = logsData.logs.length ? logsData.logs.join('\n') : 'Aguardando comando...';
+        pre.scrollTop = pre.scrollHeight;
+        const est = statusData.estado || {};
+        const rodando = statusData.rodando;
+        const parando = est.parando;
+        const dot = document.getElementById('dot');
+        const lbl = document.getElementById('status-label');
+        if (parando)      { dot.className = 'dot warn'; lbl.textContent = 'DESLIGANDO...'; setEstadoBotoes('desligando'); }
+        else if (rodando) { dot.className = 'dot on';   lbl.textContent = 'RODANDO';       setEstadoBotoes('rodando'); }
+        else              { dot.className = 'dot';      lbl.textContent = 'DESLIGADO';     setEstadoBotoes('parado'); }
+        document.getElementById('s-cand').textContent  = est.candidaturas_enviadas ?? 0;
+        document.getElementById('s-anal').textContent  = est.vagas_analisadas ?? 0;
+        document.getElementById('s-total').textContent = est.total_aplicadas_persistente ?? 0;
+        document.getElementById('s-ini').textContent   = est.iniciado_em || '-';
+        document.getElementById('pesquisa-atual').textContent =
+          est.pesquisa_atual ? ('Termo atual: ' + est.pesquisa_atual) : '';
+        document.getElementById('erro').textContent = est.erro_atual ? ('! ' + est.erro_atual) : '';
+      } catch(e) {}
+    }
+    setInterval(atualizar, 1000);
+    atualizar();
+  </script>
+</body>
+</html>

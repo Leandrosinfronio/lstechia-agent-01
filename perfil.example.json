@@ -1,0 +1,22 @@
+{
+  "nome": "Seu Nome",
+  "cidade": "Sua Cidade",
+  "telefone": "",
+  "anos_experiencia": 5,
+  "pretensao_salarial": "",
+  "areas": [
+    "Inteligencia Artificial",
+    "Infraestrutura de TI",
+    "Cyber Security",
+    "Cloud",
+    "Automacao"
+  ],
+  "resumo": "Resumo profissional usado pelo agente para avaliar vagas e preencher candidaturas.",
+  "tecnologias": [
+    "Python",
+    "FastAPI",
+    "AWS",
+    "Azure",
+    "Linux"
+  ]
+}
