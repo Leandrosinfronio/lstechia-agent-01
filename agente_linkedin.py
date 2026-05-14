@@ -96,6 +96,11 @@ TIPOS_DE_VAGA = {
     ],
 }
 
+TECNOLOGIAS_ESPECIFICAS = [
+    "sap", "s/4hana", "s4hana", "ecc", "sap sd", "sap mm", "wis web",
+    "abap", "salesforce", "oracle ebs", "totvs", "protheus",
+]
+
 
 def _agora() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1097,7 +1102,10 @@ class AgenteLinkedIn:
         if not normalizadas:
             return None
         exige_preferida = False
-        if any(k in ctx for k in ["possui", "experiencia", "experience", "tem conhecimento", "conhecimento", "atuou", "trabalhou"]):
+        if self._pergunta_sobre_tecnologia_fora_do_perfil(ctx):
+            preferidas = ["nao", "não", "no", "no tengo", "no possuo"]
+            exige_preferida = True
+        elif any(k in ctx for k in ["possui", "experiencia", "experience", "tem conhecimento", "conhecimento", "atuou", "trabalhou"]):
             preferidas = ["sim", "yes", "si", "tenho", "possuo"]
             exige_preferida = True
         elif any(k in ctx for k in ["ingles", "english", "spoken english", "autorizado", "authorized", "eligible"]):
@@ -1118,6 +1126,17 @@ class AgenteLinkedIn:
             if normalizada not in ("selecionar opcao", "selecciona una opcion", "select an option", "selecione", "select"):
                 return original
         return None
+
+    def _pergunta_sobre_tecnologia_fora_do_perfil(self, ctx: str) -> bool:
+        if not any(k in ctx for k in ["possui", "experiencia", "experience", "conhecimento", "atuou", "trabalhou"]):
+            return False
+        tecnologias_perfil = " ".join(str(t) for t in self.perfil.get("tecnologias", []))
+        tecnologias_perfil = self._normalizar_texto(tecnologias_perfil)
+        for termo in TECNOLOGIAS_ESPECIFICAS:
+            termo_norm = self._normalizar_texto(termo)
+            if termo_norm in ctx and termo_norm not in tecnologias_perfil:
+                return True
+        return False
 
     async def _preencher_selects(self) -> None:
         try:
