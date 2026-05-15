@@ -1,4 +1,5 @@
 .env
+config_runtime.json
 perfil.json
 vagas_aplicadas.json
 agent.log

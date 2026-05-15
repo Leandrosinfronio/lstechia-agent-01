@@ -8,7 +8,7 @@ Painel local para operar um agente assistido de candidaturas no LinkedIn, com Fa
 - Logs em tempo real
 - Contadores de vagas analisadas e candidaturas
 - Modo assistido com destaque visual, pausa e cursor `LS`
-- Integração opcional com Ollama para avaliar compatibilidade
+- Integracao com OpenAI para avaliar compatibilidade
 - Seleção automática de currículo por tipo de vaga
 - Preenchimento contextual de perguntas adicionais, como salario, ingles, portfolio e disponibilidade
 - Perfil do Chrome isolado para manter login localmente
@@ -31,6 +31,7 @@ copy perfil.example.json perfil.json
 
 4. Edite `.env` e `perfil.json` com seus dados locais.
    - Em `perfil.json`, ajuste `curriculos.ia.identificadores` e `curriculos.infraestrutura.identificadores` com nomes que apareçam nas opções de currículo do LinkedIn.
+   - Em `.env`, preencha `OPENAI_API_KEY`. Por padrao, `USAR_OPENAI=true`, `USAR_GROQ=false` e `USAR_OLLAMA=false`.
 5. Abra o Chrome em modo debug:
 
 ```bat

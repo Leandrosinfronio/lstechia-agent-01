@@ -10,11 +10,11 @@ from collections import deque
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Body
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from agente_linkedin import AgenteLinkedIn, snapshot_estado
+from agente_linkedin import AgenteLinkedIn, carregar_config_runtime, salvar_config_runtime, snapshot_estado
 
 
 LOGS_MAX = 500
@@ -144,3 +144,20 @@ def get_stats():
             "iniciado_em": estado.get("iniciado_em"),
         }
     )
+
+
+@app.get("/config")
+def get_config():
+    return carregar_config_runtime()
+
+
+@app.post("/config")
+def post_config(payload: dict = Body(...)):
+    if task_agente is not None and not task_agente.done():
+        return JSONResponse(
+            {"ok": False, "status": "Desligue o agente antes de alterar controles de custo."},
+            status_code=409,
+        )
+    config = salvar_config_runtime(payload)
+    add_log("Controles de custo/IA atualizados no painel.")
+    return {"ok": True, "config": config}

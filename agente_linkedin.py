@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import subprocess
 import time
 import unicodedata
@@ -32,6 +33,7 @@ BASE_DIR = Path(__file__).parent
 load_dotenv(BASE_DIR / ".env")
 
 PERFIL_PATH = BASE_DIR / "perfil.json"
+CONFIG_RUNTIME_PATH = BASE_DIR / "config_runtime.json"
 VAGAS_APLICADAS_PATH = BASE_DIR / "vagas_aplicadas.json"
 LOG_FILE = BASE_DIR / "agent.log"
 LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", "1000000"))
@@ -52,11 +54,41 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 USAR_OLLAMA = os.getenv("USAR_OLLAMA", "false").lower() in ("1", "true", "sim", "yes")
 OLLAMA_TIMEOUT_S = float(os.getenv("OLLAMA_TIMEOUT_S", "5"))
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+USAR_OPENAI = os.getenv("USAR_OPENAI", "true").lower() in ("1", "true", "sim", "yes")
+OPENAI_TIMEOUT_S = float(os.getenv("OPENAI_TIMEOUT_S", "12"))
+OPENAI_URL = os.getenv("OPENAI_URL", "https://api.openai.com/v1/chat/completions")
+OPENAI_API_KEY_CONFIGURADA = bool(OPENAI_API_KEY) and not OPENAI_API_KEY.startswith("coloque_sua_chave")
+
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
+USAR_SERPER_SALARIO = os.getenv("USAR_SERPER_SALARIO", "false").lower() in ("1", "true", "sim", "yes")
+SERPER_TIMEOUT_S = float(os.getenv("SERPER_TIMEOUT_S", "8"))
+SERPER_API_KEY_CONFIGURADA = bool(SERPER_API_KEY) and not SERPER_API_KEY.startswith("coloque_sua_chave")
+SERPER_URL = "https://google.serper.dev/search"
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 USAR_GROQ = os.getenv("USAR_GROQ", "false").lower() in ("1", "true", "sim", "yes")
 GROQ_TIMEOUT_S = float(os.getenv("GROQ_TIMEOUT_S", "8"))
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_API_KEY_CONFIGURADA = bool(GROQ_API_KEY) and not GROQ_API_KEY.startswith("coloque_sua_chave")
+
+SALARIO_MERCADO_AUTO = os.getenv("SALARIO_MERCADO_AUTO", "true").lower() in ("1", "true", "sim", "yes")
+SALARIO_PISO_CLT = float(os.getenv("SALARIO_PISO_CLT", "8000"))
+SALARIO_PISO_PJ = float(os.getenv("SALARIO_PISO_PJ", "8500"))
+SALARIO_PISO_USD = float(os.getenv("SALARIO_PISO_USD", "1600"))
+
+CONFIG_RUNTIME_DEFAULT = {
+    "usar_openai": USAR_OPENAI,
+    "usar_groq": USAR_GROQ,
+    "usar_ollama": USAR_OLLAMA,
+    "usar_serper_salario": USAR_SERPER_SALARIO,
+    "salario_mercado_auto": SALARIO_MERCADO_AUTO,
+    "salario_piso_clt": SALARIO_PISO_CLT,
+    "salario_piso_pj": SALARIO_PISO_PJ,
+    "salario_piso_usd": SALARIO_PISO_USD,
+}
 
 PESQUISAS_PADRAO = [
     "analista de TI",
@@ -124,6 +156,36 @@ def _log_arquivo(msg: str) -> None:
         pass
 
 
+def carregar_config_runtime() -> dict:
+    config = dict(CONFIG_RUNTIME_DEFAULT)
+    if CONFIG_RUNTIME_PATH.exists():
+        try:
+            dados = json.loads(CONFIG_RUNTIME_PATH.read_text(encoding="utf-8"))
+            if isinstance(dados, dict):
+                config.update(dados)
+        except Exception:
+            pass
+    return config
+
+
+def salvar_config_runtime(config: dict) -> dict:
+    atual = carregar_config_runtime()
+    for chave, valor in config.items():
+        if chave not in CONFIG_RUNTIME_DEFAULT:
+            continue
+        if isinstance(CONFIG_RUNTIME_DEFAULT[chave], bool):
+            atual[chave] = bool(valor)
+        elif isinstance(CONFIG_RUNTIME_DEFAULT[chave], (int, float)):
+            try:
+                atual[chave] = float(valor)
+            except (TypeError, ValueError):
+                continue
+        else:
+            atual[chave] = valor
+    CONFIG_RUNTIME_PATH.write_text(json.dumps(atual, ensure_ascii=False, indent=2), encoding="utf-8")
+    return atual
+
+
 @dataclass
 class EstadoAgente:
     rodando: bool = False
@@ -151,6 +213,91 @@ class EstadoAgente:
         }
 
 
+@dataclass
+class DecisaoOrquestrador:
+    acao: str
+    valor: Optional[str] = None
+    origem: str = "regra"
+    confianca: str = "media"
+    motivo: str = ""
+
+
+class OrquestradorCandidatura:
+    """Centraliza decisoes; o agente executor apenas aplica no LinkedIn."""
+
+    def __init__(self, agente):
+        self.agente = agente
+
+    async def avaliar_vaga(self, texto_vaga: str, tipo_vaga: str) -> bool:
+        if self.agente._config_bool("usar_openai", USAR_OPENAI) and OPENAI_API_KEY_CONFIGURADA:
+            return await self.agente._ia_openai(texto_vaga)
+        return self.agente._fallback_heuristico(texto_vaga, tipo_vaga)
+
+    async def responder_texto(self, contexto: str, tipo_campo: str = "text") -> DecisaoOrquestrador:
+        ctx = self.agente._normalizar_texto(contexto)
+        if self.agente._ctx_salario(ctx):
+            salario, origem_salario = await self.agente._salario_orquestrado(ctx)
+            if salario:
+                return DecisaoOrquestrador(
+                    acao="preencher_texto",
+                    valor=str(salario),
+                    origem=origem_salario,
+                    confianca="media" if origem_salario == "mercado_ia" else "alta",
+                    motivo="Pretensao salarial calculada pelo orquestrador.",
+                )
+        resposta = self.agente._resposta_para_contexto(ctx)
+        if resposta not in (None, ""):
+            return DecisaoOrquestrador(
+                acao="preencher_texto",
+                valor=str(resposta),
+                origem="perfil",
+                confianca="alta",
+                motivo="Resposta encontrada no perfil local.",
+            )
+        resposta_ia = await self.agente._ia_responder_campo(contexto or ctx, tipo_campo)
+        if resposta_ia:
+            return DecisaoOrquestrador(
+                acao="preencher_texto",
+                valor=resposta_ia,
+                origem="openai",
+                confianca="media",
+                motivo="Resposta inferida pela OpenAI com base no perfil.",
+            )
+        return DecisaoOrquestrador(
+            acao="pausar_para_revisao",
+            origem="orquestrador",
+            confianca="baixa",
+            motivo="Nao encontrou resposta segura no perfil nem na IA.",
+        )
+
+    async def escolher_opcao(self, contexto: str, opcoes: list[str]) -> DecisaoOrquestrador:
+        ctx = self.agente._normalizar_texto(contexto)
+        escolha = self.agente._opcao_para_contexto(ctx, opcoes)
+        if escolha:
+            return DecisaoOrquestrador(
+                acao="selecionar_opcao",
+                valor=escolha,
+                origem="perfil",
+                confianca="alta",
+                motivo="Opcao escolhida por regras do perfil.",
+            )
+        escolha_ia = await self.agente._ia_escolher_opcao(contexto or ctx, opcoes)
+        if escolha_ia:
+            return DecisaoOrquestrador(
+                acao="selecionar_opcao",
+                valor=escolha_ia,
+                origem="openai",
+                confianca="media",
+                motivo="Opcao escolhida pela OpenAI com base no perfil.",
+            )
+        return DecisaoOrquestrador(
+            acao="pausar_para_revisao",
+            origem="orquestrador",
+            confianca="baixa",
+            motivo="Nenhuma opcao segura foi identificada.",
+        )
+
+
 class AgenteLinkedIn:
     """Agente unico e isolado. Pode coexistir com agent-02, agent-03 etc."""
 
@@ -163,6 +310,11 @@ class AgenteLinkedIn:
         self._playwright: Optional[Playwright] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
+        self._texto_vaga_atual = ""
+        self._cache_salario: dict[str, str] = {}
+        self._cache_busca_salario: dict[str, str] = {}
+        self.config_runtime = carregar_config_runtime()
+        self.orquestrador = OrquestradorCandidatura(self)
         self._carregar_vagas_aplicadas()
 
     def log(self, msg: str) -> None:
@@ -170,6 +322,15 @@ class AgenteLinkedIn:
         self.estado.ultima_atividade = msg
         self.log_callback(carimbo)
         _log_arquivo(carimbo)
+
+    def _config_bool(self, chave: str, padrao: bool = False) -> bool:
+        return bool(self.config_runtime.get(chave, padrao))
+
+    def _config_float(self, chave: str, padrao: float) -> float:
+        try:
+            return float(self.config_runtime.get(chave, padrao))
+        except (TypeError, ValueError):
+            return float(padrao)
 
     def _carregar_vagas_aplicadas(self) -> None:
         if VAGAS_APLICADAS_PATH.exists():
@@ -685,18 +846,36 @@ class AgenteLinkedIn:
                 return
             try:
                 await self._fechar_modal()
-                link = await vaga.get_attribute("href")
+                link = await vaga.get_attribute("href") or ""
                 if not link:
                     continue
-                chave = link.split("?")[0]
+                # Normaliza chave para só o ID numérico, independente de URL relativa ou absoluta
+                _m = re.search(r"/jobs/view/(\d+)", link)
+                chave = f"/jobs/view/{_m.group(1)}/" if _m else link.split("?")[0]
                 if chave in self.estado.vagas_aplicadas or chave in self.estado.vagas_tentadas:
                     continue
+                # Verifica texto do card antes de clicar (evita clicar em "Candidatou-se")
+                try:
+                    texto_card = (await vaga.inner_text()).lower()
+                    if "candidatou-se" in texto_card or "applied" in texto_card:
+                        self.estado.vagas_aplicadas.add(chave)
+                        self._salvar_vagas_aplicadas()
+                        continue
+                except Exception:
+                    pass
                 if not await self._click_assistido(vaga, "card da vaga", timeout=8000):
                     continue
                 await self._sleep_jitter((1, 2))
                 await self._fechar_popups()
                 self.estado.vagas_analisadas += 1
                 texto = await self._page.locator("body").inner_text()
+                # Verifica se a página já mostra "Candidatou-se" ou "Applied"
+                texto_lower = texto.lower()
+                if "candidatou-se" in texto_lower or ("applied" in texto_lower and "easy apply" not in texto_lower):
+                    self.log(f"Vaga ja candidatada anteriormente. Pulando: {chave}")
+                    self.estado.vagas_aplicadas.add(chave)
+                    self._salvar_vagas_aplicadas()
+                    continue
                 if not self._tem_candidatura_simplificada(texto):
                     continue
                 tipo_vaga = self._tipo_de_vaga(texto)
@@ -756,6 +935,48 @@ class AgenteLinkedIn:
             f"VAGA:\n{texto_vaga[:4500]}\n"
         )
 
+    def _prompt_resposta_candidatura(self, contexto_pergunta: str, tipo_campo: str) -> str:
+        return (
+            "Voce preenche perguntas de candidatura do LinkedIn usando SOMENTE o perfil abaixo.\n"
+            "Responda com o valor direto para preencher o campo, sem explicacao, sem aspas e sem markdown.\n"
+            "Se a pergunta pedir algo que nao existe no perfil ou depender de decisao humana, responda: NAO_RESPONDER.\n"
+            "Se for pergunta de sim/nao, responda apenas Sim ou Nao.\n"
+            "Se for numero, responda apenas o numero.\n"
+            "Nao invente certificacoes, tecnologias, empresas anteriores, vistos, diplomas ou experiencias.\n\n"
+            f"TIPO_DO_CAMPO: {tipo_campo or 'text'}\n\n"
+            f"PERFIL:\n{json.dumps(self.perfil, ensure_ascii=False)}\n\n"
+            f"PERGUNTA_OU_CONTEXTO_DO_CAMPO:\n{contexto_pergunta[:1800]}\n"
+        )
+
+    def _prompt_escolha_opcao_candidatura(self, contexto_pergunta: str, opcoes: list[str]) -> str:
+        return (
+            "Voce preenche perguntas de candidatura do LinkedIn usando SOMENTE o perfil abaixo.\n"
+            "Escolha UMA das opcoes disponiveis para responder a pergunta.\n"
+            "Responda exatamente com o texto de uma opcao, sem explicacao, sem aspas e sem markdown.\n"
+            "Se a pergunta pedir tecnologia, modulo, certificacao ou experiencia que nao aparece no perfil, escolha a opcao negativa.\n"
+            "Nao invente certificacoes, tecnologias, empresas anteriores, vistos, diplomas ou experiencias.\n"
+            "Se nenhuma opcao for segura, responda: NAO_RESPONDER.\n\n"
+            f"PERFIL:\n{json.dumps(self.perfil, ensure_ascii=False)}\n\n"
+            f"PERGUNTA:\n{contexto_pergunta[:1800]}\n\n"
+            f"OPCOES:\n{json.dumps(opcoes[:20], ensure_ascii=False)}\n"
+        )
+
+    def _prompt_salario_mercado(self, contexto_pergunta: str, dados_mercado: str = "") -> str:
+        bloco_mercado = f"\nDADOS_RECENTES_DE_BUSCA:\n{dados_mercado[:2500]}\n" if dados_mercado else ""
+        return (
+            "Voce estima pretensao salarial para candidatura no Brasil usando conhecimento de mercado, "
+            "o perfil do candidato e o texto da vaga. Nao navegue e nao cite fontes.\n"
+            "Responda APENAS com um numero inteiro, sem moeda, sem ponto de milhar, sem explicacao.\n"
+            "Use um valor competitivo, mas realista, para aumentar chance de entrevista.\n"
+            "Respeite estes pisos minimos: CLT 8000 BRL/mes, PJ 8500 BRL/mes, USD 1600/mes.\n"
+            "Se o campo pedir USD/dollar, responda em USD mensal. Se pedir PJ/contractor, responda BRL mensal PJ. "
+            "Caso contrario, responda BRL mensal CLT.\n\n"
+            f"PERFIL:\n{json.dumps(self.perfil, ensure_ascii=False)}\n\n"
+            f"CAMPO_DE_SALARIO:\n{contexto_pergunta[:1200]}\n\n"
+            f"{bloco_mercado}"
+            f"VAGA:\n{self._texto_vaga_atual[:3500]}\n"
+        )
+
     @staticmethod
     def _avaliar_resposta_ia(resposta: str) -> bool:
         decisao = resposta.upper()
@@ -764,6 +985,8 @@ class AgenteLinkedIn:
         return "COMPATIVEL" in decisao
 
     async def _ia_groq(self, texto_vaga: str) -> bool:
+        if not GROQ_API_KEY_CONFIGURADA:
+            return True
         try:
             async with httpx.AsyncClient(timeout=GROQ_TIMEOUT_S) as client:
                 r = await client.post(
@@ -776,6 +999,7 @@ class AgenteLinkedIn:
                         "temperature": 0,
                     },
                 )
+                r.raise_for_status()
                 resposta = r.json()["choices"][0]["message"]["content"]
                 self.log(f"Groq ({GROQ_MODEL}): {resposta[:80]}")
                 return self._avaliar_resposta_ia(resposta)
@@ -783,14 +1007,251 @@ class AgenteLinkedIn:
             self.log(f"AVISO: Groq indisponivel ({e}). Aprovado pela heuristica.")
             return True
 
+    async def _ia_openai(self, texto_vaga: str) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=OPENAI_TIMEOUT_S) as client:
+                r = await client.post(
+                    OPENAI_URL,
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "model": OPENAI_MODEL,
+                        "messages": [{"role": "user", "content": self._prompt_ia(texto_vaga)}],
+                        "max_tokens": 100,
+                        "temperature": 0,
+                    },
+                )
+                r.raise_for_status()
+                resposta = r.json()["choices"][0]["message"]["content"]
+                self.log(f"OpenAI ({OPENAI_MODEL}): {resposta[:80]}")
+                return self._avaliar_resposta_ia(resposta)
+        except Exception as e:
+            self.log(f"AVISO: OpenAI indisponivel ({e}). Aprovado pela heuristica.")
+            return True
+
+    async def _ia_responder_campo(self, contexto_pergunta: str, tipo_campo: str = "text") -> Optional[str]:
+        if not contexto_pergunta or len(contexto_pergunta.strip()) < 8:
+            return None
+        prompt = self._prompt_resposta_candidatura(contexto_pergunta, tipo_campo)
+        # Tenta OpenAI primeiro
+        usar_openai = self._config_bool("usar_openai", USAR_OPENAI) and OPENAI_API_KEY_CONFIGURADA
+        if usar_openai:
+            try:
+                async with httpx.AsyncClient(timeout=OPENAI_TIMEOUT_S) as client:
+                    r = await client.post(
+                        OPENAI_URL,
+                        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                        json={
+                            "model": OPENAI_MODEL,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": 120,
+                            "temperature": 0,
+                        },
+                    )
+                    if r.status_code == 429:
+                        self.log("OpenAI 429 (rate limit) no campo — tentando Groq...")
+                    else:
+                        r.raise_for_status()
+                        resposta = r.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'")
+                        if resposta and "NAO_RESPONDER" not in resposta.upper():
+                            self.log(f"OpenAI respondeu campo: {contexto_pergunta[:60]} -> {resposta[:60]}")
+                            return resposta
+                        self.log(f"OpenAI nao respondeu campo: {contexto_pergunta[:80]}")
+                        return None
+            except Exception as e:
+                self.log(f"AVISO: OpenAI campo falhou ({e}) — tentando Groq...")
+        # Fallback Groq
+        usar_groq = self._config_bool("usar_groq", USAR_GROQ) and GROQ_API_KEY_CONFIGURADA
+        if usar_groq:
+            try:
+                async with httpx.AsyncClient(timeout=GROQ_TIMEOUT_S) as client:
+                    r = await client.post(
+                        GROQ_URL,
+                        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                        json={
+                            "model": GROQ_MODEL,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": 120,
+                            "temperature": 0,
+                        },
+                    )
+                    r.raise_for_status()
+                    resposta = r.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'")
+                    if resposta and "NAO_RESPONDER" not in resposta.upper():
+                        self.log(f"Groq respondeu campo: {contexto_pergunta[:60]} -> {resposta[:60]}")
+                        return resposta
+            except Exception as e:
+                self.log(f"AVISO: Groq campo falhou ({e}).")
+        return None
+
+    async def _ia_escolher_opcao(self, contexto_pergunta: str, opcoes: list[str]) -> Optional[str]:
+        _placeholders = (
+            "selecionar opcao", "selecionar op??o", "seleccione una opcion",
+            "selecciona una opcion", "selecciona una opci?n", "selecciona una opción",
+            "select an option", "selecione", "select",
+        )
+        opcoes_validas = [
+            o for o in opcoes
+            if self._normalizar_texto(o) and self._normalizar_texto(o) not in _placeholders
+        ]
+        if not contexto_pergunta or not opcoes_validas:
+            return None
+        prompt = self._prompt_escolha_opcao_candidatura(contexto_pergunta, opcoes_validas)
+
+        def _extrair_opcao(resposta_bruta: str) -> Optional[str]:
+            resposta_norm = self._normalizar_texto(resposta_bruta.strip().strip('"').strip("'"))
+            if not resposta_norm or "nao_responder" in resposta_norm:
+                return None
+            for opcao in opcoes_validas:
+                if self._normalizar_texto(opcao) == resposta_norm:
+                    return opcao
+            for opcao in opcoes_validas:
+                norm = self._normalizar_texto(opcao)
+                if resposta_norm in norm or norm in resposta_norm:
+                    return opcao
+            return None
+
+        # Tenta OpenAI primeiro
+        usar_openai = self._config_bool("usar_openai", USAR_OPENAI) and OPENAI_API_KEY_CONFIGURADA
+        if usar_openai:
+            try:
+                async with httpx.AsyncClient(timeout=OPENAI_TIMEOUT_S) as client:
+                    r = await client.post(
+                        OPENAI_URL,
+                        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                        json={
+                            "model": OPENAI_MODEL,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": 80,
+                            "temperature": 0,
+                        },
+                    )
+                    if r.status_code == 429:
+                        self.log("OpenAI 429 (rate limit) na opcao — tentando Groq...")
+                    else:
+                        r.raise_for_status()
+                        resposta = r.json()["choices"][0]["message"]["content"].strip()
+                        opcao = _extrair_opcao(resposta)
+                        if opcao:
+                            self.log(f"OpenAI escolheu opcao: {contexto_pergunta[:60]} -> {opcao[:60]}")
+                            return opcao
+                        self.log(f"OpenAI retornou opcao fora da lista: {resposta[:80]}")
+                        return None
+            except Exception as e:
+                self.log(f"AVISO: OpenAI opcao falhou ({e}) — tentando Groq...")
+        # Fallback Groq
+        usar_groq = self._config_bool("usar_groq", USAR_GROQ) and GROQ_API_KEY_CONFIGURADA
+        if usar_groq:
+            try:
+                async with httpx.AsyncClient(timeout=GROQ_TIMEOUT_S) as client:
+                    r = await client.post(
+                        GROQ_URL,
+                        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                        json={
+                            "model": GROQ_MODEL,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": 80,
+                            "temperature": 0,
+                        },
+                    )
+                    r.raise_for_status()
+                    resposta = r.json()["choices"][0]["message"]["content"].strip()
+                    opcao = _extrair_opcao(resposta)
+                    if opcao:
+                        self.log(f"Groq escolheu opcao: {contexto_pergunta[:60]} -> {opcao[:60]}")
+                        return opcao
+                    self.log(f"Groq retornou opcao fora da lista: {resposta[:80]}")
+            except Exception as e:
+                self.log(f"AVISO: Groq opcao falhou ({e}).")
+        return None
+
+    async def _ia_salario_mercado(self, contexto_pergunta: str, dados_mercado: str = "") -> Optional[str]:
+        if not self._salario_mercado_disponivel():
+            return None
+        cache_key = f"{self._normalizar_texto(contexto_pergunta)[:120]}::{self._normalizar_texto(self._texto_vaga_atual)[:220]}"
+        if cache_key in self._cache_salario:
+            return self._cache_salario[cache_key]
+        try:
+            async with httpx.AsyncClient(timeout=OPENAI_TIMEOUT_S) as client:
+                r = await client.post(
+                    OPENAI_URL,
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "model": OPENAI_MODEL,
+                        "messages": [{"role": "user", "content": self._prompt_salario_mercado(contexto_pergunta, dados_mercado)}],
+                        "max_tokens": 20,
+                        "temperature": 0,
+                    },
+                )
+                r.raise_for_status()
+                bruto = r.json()["choices"][0]["message"]["content"].strip()
+                digits = "".join(c for c in bruto if c.isdigit())
+                if not digits:
+                    return None
+                valor = self._aplicar_piso_salario(int(digits), contexto_pergunta)
+                resposta = str(valor)
+                self._cache_salario[cache_key] = resposta
+                self.log(f"Salario estimado por mercado/IA: {resposta}")
+                return resposta
+        except Exception as e:
+            self.log(f"AVISO: OpenAI nao estimou salario ({e}). Usando piso do perfil.")
+            return None
+
+    def _consulta_salario_serper(self, ctx: str) -> str:
+        texto = self._normalizar_texto(f"{ctx} {self._texto_vaga_atual[:1800]}")
+        area = "infraestrutura ti cloud aws"
+        if any(k in texto for k in ["cyber", "seguranca", "security", "soc"]):
+            area = "ciberseguranca seguranca informacao"
+        elif any(k in texto for k in ["devops", "sre"]):
+            area = "devops sre cloud"
+        elif any(k in texto for k in ["python", "desenvolvedor", "backend", "full stack"]):
+            area = "desenvolvedor python backend"
+        regime = "clt"
+        if any(k in texto for k in ["pj", "contractor", "prestador"]):
+            regime = "pj"
+        elif any(k in texto for k in ["usd", "dollar", "dolar"]):
+            regime = "usd remoto"
+        return f"salario {area} pleno senior {regime} Brasil remoto 2026"
+
+    async def _serper_salario_mercado(self, contexto_pergunta: str) -> str:
+        if not self._serper_salario_disponivel():
+            return ""
+        query = self._consulta_salario_serper(contexto_pergunta)
+        if query in self._cache_busca_salario:
+            return self._cache_busca_salario[query]
+        try:
+            async with httpx.AsyncClient(timeout=SERPER_TIMEOUT_S) as client:
+                r = await client.post(
+                    SERPER_URL,
+                    headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                    json={"q": query, "gl": "br", "hl": "pt-br", "num": 5},
+                )
+                r.raise_for_status()
+                data = r.json()
+                partes: list[str] = []
+                answer_box = data.get("answerBox") or {}
+                if answer_box:
+                    partes.append(str(answer_box.get("answer") or answer_box.get("snippet") or ""))
+                for item in (data.get("organic") or [])[:5]:
+                    titulo = item.get("title") or ""
+                    snippet = item.get("snippet") or ""
+                    link = item.get("link") or ""
+                    partes.append(f"{titulo}: {snippet} ({link})")
+                texto = "\n".join(p for p in partes if p).strip()
+                self._cache_busca_salario[query] = texto
+                self.log(f"Serper salario consultado: {query}")
+                return texto
+        except Exception as e:
+            self.log(f"AVISO: Serper salario indisponivel ({e}).")
+            return ""
+
     async def _ia_diz_compativel(self, texto_vaga: str, tipo_vaga: str) -> bool:
-        if not self._fallback_heuristico(texto_vaga, tipo_vaga):
+        if not await self.orquestrador.avaliar_vaga(texto_vaga, tipo_vaga):
             return False
 
-        if USAR_GROQ and GROQ_API_KEY:
+        if self._config_bool("usar_groq", USAR_GROQ) and GROQ_API_KEY:
             return await self._ia_groq(texto_vaga)
 
-        if not USAR_OLLAMA:
+        if not self._config_bool("usar_ollama", USAR_OLLAMA):
             return True
 
         try:
@@ -812,6 +1273,7 @@ class AgenteLinkedIn:
         return sum(1 for p in palavras if p in t) >= minimo
 
     async def _tentar_candidatar(self, texto_vaga: str = "", tipo_vaga: str = "geral") -> bool:
+        self._texto_vaga_atual = texto_vaga or ""
         try:
             botao = self._page.locator(
                 ".jobs-search__job-details--container button.jobs-apply-button, "
@@ -856,7 +1318,7 @@ class AgenteLinkedIn:
                 if revisar_visivel is not None:
                     _revisar_consecutivo += 1
                     if _revisar_consecutivo >= 5:
-                        self.log("AVISO: loop em Revisar (5x). Descartando vaga.")
+                        self._pausar_para_revisao("Loop em Revisar (5x). Descartando e continuando para proxima vaga.")
                         await self._fechar_modal()
                         return False
                     # Tenta preencher campos pendentes antes de clicar Revisar
@@ -896,7 +1358,7 @@ class AgenteLinkedIn:
                         _etapas_travadas += 1
                         self.log(f"AVISO: etapa nao avancou ({_etapas_travadas}/2). Tentando preencher novamente...")
                         if _etapas_travadas >= 2:
-                            self.log("AVISO: etapa travada 2x. Descartando vaga.")
+                            self._pausar_para_revisao("Etapa travada 2x. Descartando e continuando para proxima vaga.")
                             await self._fechar_modal()
                             return False
                         await self._preencher_campos_modal()
@@ -909,7 +1371,7 @@ class AgenteLinkedIn:
                         erros_consecutivos += 1
                         self.log(f"AVISO: campo obrigatorio vazio (tentativa {erros_consecutivos}/3). Tentando preencher...")
                         if erros_consecutivos >= 3:
-                            self.log("AVISO: 3 erros consecutivos. Descartando vaga.")
+                            self._pausar_para_revisao("3 erros consecutivos em campo obrigatorio. Descartando e continuando.")
                             await self._fechar_modal()
                             return False
                         await asyncio.sleep(0.5)
@@ -918,8 +1380,10 @@ class AgenteLinkedIn:
                     else:
                         erros_consecutivos = 0
                     continue
+                self._pausar_para_revisao("Nao encontrei botao de avancar/enviar. Descartando e continuando.")
                 await self._fechar_modal()
                 return False
+            self._pausar_para_revisao("Limite de etapas atingido. Descartando e continuando.")
             await self._fechar_modal()
             return False
         except Exception as e:
@@ -1228,9 +1692,10 @@ class AgenteLinkedIn:
                 tipo = (await campo.get_attribute("type")) or ""
                 contexto_visual = await self._contexto_do_campo(campo)
                 ctx = self._normalizar_texto(f"{placeholder} {aria} {name} {contexto_visual}")
-                resposta = self._resposta_para_contexto(ctx)
-                if resposta:
-                    await campo.fill(self._formatar_resposta_para_campo(resposta, tipo, ctx))
+                decisao = await self.orquestrador.responder_texto(f"{placeholder} {aria} {name} {contexto_visual}", tipo)
+                if decisao.acao == "preencher_texto" and decisao.valor:
+                    await campo.fill(self._formatar_resposta_para_campo(decisao.valor, tipo, ctx))
+                    self.log(f"Orquestrador preencheu campo ({decisao.origem}/{decisao.confianca}): {ctx[:60]}")
                     if any(k in ctx for k in ["cidade", "city", "location", "localizacao"]):
                         await self._selecionar_autocomplete_cidade()
                     continue
@@ -1263,11 +1728,6 @@ class AgenteLinkedIn:
                         await campo.fill("1")  # Básico para dev fora do foco principal
                     else:
                         await campo.fill(str(anos))
-                    continue
-                if any(k in ctx for k in ["salario", "salary", "pretensao", "remuneration"]):
-                    salario = self.perfil.get("pretensao_salarial")
-                    if salario:
-                        await campo.fill(str(salario))
                     continue
                 if any(k in ctx for k in ["headline", "titulo profissional", "professional headline", "cargo atual", "job title"]):
                     await campo.fill(self.perfil.get("titulo_profissional", "Analista de TI | Infraestrutura | IA | Cloud | DevOps | Python"))
@@ -1305,16 +1765,47 @@ class AgenteLinkedIn:
                         });
                     }
                     let node = el;
-                    for (let i = 0; i < 4 && node; i++) {
+                    for (let i = 0; i < 7 && node; i++) {
                         bits.push(node.innerText || node.textContent || '');
                         node = node.parentElement;
                     }
-                    return bits.join(' ').slice(0, 1200);
+                    return bits.join(' ').slice(0, 2000);
                 }
                 """
             )
         except Exception:
             return ""
+
+    async def _contexto_dropdown(self, botao) -> str:
+        try:
+            return await botao.evaluate(
+                """
+                (el) => {
+                    const bits = [];
+                    const id = el.getAttribute('id');
+                    const ariaLabelledby = el.getAttribute('aria-labelledby');
+                    const ariaDescribedby = el.getAttribute('aria-describedby');
+                    for (const attr of [id, ariaLabelledby, ariaDescribedby]) {
+                        if (!attr) continue;
+                        for (const part of attr.split(/\\s+/)) {
+                            const node = document.getElementById(part);
+                            if (node) bits.push(node.innerText || node.textContent || '');
+                        }
+                    }
+                    let row = el.closest('label, fieldset, [data-test-form-builder-radio-button-form-component], [data-test-form-builder-form-component], .fb-dash-form-element, .jobs-easy-apply-form-section__grouping, .artdeco-text-input--container, div');
+                    let node = row || el.parentElement;
+                    for (let i = 0; i < 9 && node; i++) {
+                        bits.push(node.innerText || node.textContent || '');
+                        const prev = node.previousElementSibling;
+                        if (prev) bits.push(prev.innerText || prev.textContent || '');
+                        node = node.parentElement;
+                    }
+                    return bits.join(' ').slice(0, 2500);
+                }
+                """
+            )
+        except Exception:
+            return await self._contexto_do_campo(botao)
 
     def _valor_perfil(self, *chaves, padrao=""):
         for chave in chaves:
@@ -1324,7 +1815,7 @@ class AgenteLinkedIn:
         return padrao
 
     def _formatar_resposta_para_campo(self, resposta, tipo: str, ctx: str) -> str:
-        if any(k in ctx for k in ["pretensao", "pretencao", "salary", "remuneration", "remuneracao"]):
+        if any(k in ctx for k in ["pretensao", "pretens?o", "pretencao", "pretenc?o", "salary", "remuneration", "remuneracao", "remunera??o"]):
             try:
                 valor = float(str(resposta).replace(",", "."))
                 return f"{valor:.1f}"
@@ -1332,10 +1823,56 @@ class AgenteLinkedIn:
                 return str(resposta)
         return str(resposta)
 
+    def _ctx_salario(self, ctx: str) -> bool:
+        return any(k in ctx for k in [
+            "salario", "salário", "sal?rio", "salary",
+            "pretensao", "pretens?o", "pretencao", "pretenc?o",
+            "remuneration", "remuneracao", "remunera??o", "compensation",
+        ])
+
+    def _salario_mercado_disponivel(self) -> bool:
+        return (
+            self._config_bool("salario_mercado_auto", SALARIO_MERCADO_AUTO)
+            and self._config_bool("usar_openai", USAR_OPENAI)
+            and OPENAI_API_KEY_CONFIGURADA
+        )
+
+    def _serper_salario_disponivel(self) -> bool:
+        return (
+            self._config_bool("usar_serper_salario", USAR_SERPER_SALARIO)
+            and SERPER_API_KEY_CONFIGURADA
+        )
+
+    def _piso_salario_contexto(self, ctx: str) -> int:
+        ctx_norm = self._normalizar_texto(ctx)
+        if any(k in ctx_norm for k in ["usd", "dollar", "dolar", "monthly salary expectations"]):
+            piso = self._config_float("salario_piso_usd", SALARIO_PISO_USD)
+            return int(float(self._valor_perfil("pretensao_salarial_usd", "pretensao_salarial_usd_mensal", padrao=piso)))
+        if any(k in ctx_norm for k in ["pj", "contractor", "prestador", "cooperado"]):
+            piso = self._config_float("salario_piso_pj", SALARIO_PISO_PJ)
+            return int(float(self._valor_perfil("pretensao_salarial_pj", padrao=piso)))
+        piso = self._config_float("salario_piso_clt", SALARIO_PISO_CLT)
+        return int(float(self._valor_perfil("pretensao_salarial_clt", "pretensao_salarial", padrao=piso)))
+
+    def _aplicar_piso_salario(self, valor: int, ctx: str) -> int:
+        piso = self._piso_salario_contexto(ctx)
+        if valor < piso:
+            return piso
+        if valor > 100000:
+            return piso
+        return valor
+
+    async def _salario_orquestrado(self, ctx: str) -> tuple[str, str]:
+        dados_mercado = await self._serper_salario_mercado(ctx)
+        estimado = await self._ia_salario_mercado(ctx, dados_mercado)
+        if estimado:
+            return estimado, "serper_openai" if dados_mercado else "mercado_ia"
+        return str(self._piso_salario_contexto(ctx)), "perfil"
+
     def _resposta_para_contexto(self, ctx: str):
         if not ctx:
             return None
-        if any(k in ctx for k in ["pretensao", "pretencao", "pretensao salarial", "salary", "remuneration", "remuneracao"]):
+        if any(k in ctx for k in ["pretensao", "pretens?o", "pretencao", "pretenc?o", "pretensao salarial", "pretens?o salarial", "salary", "remuneration", "remuneracao", "remunera??o"]):
             if any(k in ctx for k in ["usd", "dollar", "dolar", "monthly salary expectations"]):
                 return self._valor_perfil("pretensao_salarial_usd", "pretensao_salarial_usd_mensal", padrao=1600)
             if any(k in ctx for k in ["pj", "cooperado", "contractor", "prestador"]):
@@ -1357,6 +1894,21 @@ class AgenteLinkedIn:
             return self._valor_perfil("modelo_trabalho", padrao="Remoto, hibrido ou presencial")
         if any(k in ctx for k in ["headline", "titulo profissional", "professional headline", "cargo atual", "job title"]):
             return self._valor_perfil("titulo_profissional", padrao="Analista de TI | Infraestrutura | IA | Cloud | DevOps | Python")
+        if any(k in ctx for k in ["formacao", "formação", "forma??o", "education", "academic", "academica", "acadêmica", "acad?mica", "escolaridade"]):
+            formacao = self.perfil.get("formacao", [])
+            if isinstance(formacao, list) and formacao:
+                return "; ".join(str(item) for item in formacao)
+            return self._valor_perfil("formacao", padrao="")
+        if any(k in ctx for k in ["certificacao", "certificação", "certifica??o", "certificacoes", "certificações", "certifica??es", "certificate", "certification"]):
+            certificacoes = self.perfil.get("certificacoes", [])
+            if isinstance(certificacoes, list) and certificacoes:
+                return "; ".join(str(item) for item in certificacoes[:8])
+            return self._valor_perfil("certificacoes", padrao="")
+        if any(k in ctx for k in ["curso", "cursos", "course", "training", "treinamento"]):
+            cursos = self.perfil.get("cursos", [])
+            if isinstance(cursos, list) and cursos:
+                return "; ".join(str(item) for item in cursos[:8])
+            return self._valor_perfil("cursos", padrao="")
         if any(k in ctx for k in ["anos", "years", "experiencia", "experience",
                                     "tempo", "how long", "quanto tempo", "trabalha com"]):
             tecnologias_fora = ["sap", "erp", "benner", "alvo", "totvs", "protheus",
@@ -1405,28 +1957,53 @@ class AgenteLinkedIn:
             return None
         exige_preferida = False
         if self._pergunta_sobre_tecnologia_fora_do_perfil(ctx):
-            preferidas = ["nao", "não", "no", "no tengo", "no possuo"]
+            preferidas = ["nao", "n?o", "não", "no", "no tengo", "no possuo"]
             exige_preferida = True
         elif any(k in ctx for k in ["non-compete", "non-solicit", "nao compete", "nao concorr"]):
-            preferidas = ["no", "nao", "não"]
+            preferidas = ["no", "nao", "n?o", "não"]
+            exige_preferida = True
+        elif any(k in ctx for k in ["deficiencia", "defici?ncia", "pessoa com defic", "pcd",
+                                        "disability", "discapacidad", "identifica como pcd",
+                                        "portador de necessidade", "necessidades especiais",
+                                        "lgbtqia", "lgbtq", "genero", "gênero", "etnia", "raca", "raça",
+                                        "orientacao sexual"]):
+            preferidas = ["nao", "n?o", "não", "no", "prefiro nao", "prefiro não"]
             exige_preferida = True
         elif any(k in ctx for k in ["sponsor", "patrocin", "immigration", "visa sponsorship"]):
-            preferidas = ["no", "nao", "não"]
+            preferidas = ["no", "nao", "n?o", "não"]
             exige_preferida = True
-        elif any(k in ctx for k in ["worked for", "ever worked", "previously employed", "worked at"]):
-            preferidas = ["no", "nao", "não"]
+        elif any(k in ctx for k in ["trabalhou na", "trabalhou no", "trabalhou em", "ja trabalhou", "já trabalhou",
+                                    "worked for", "ever worked", "previously employed", "worked at"]):
+            preferidas = ["no", "nao", "n?o", "não"]
             exige_preferida = True
         elif any(k in ctx for k in ["ma conectividade", "ma internet", "problema de internet",
                                         "conexao ruim", "dificuldade de conexao"]):
-            preferidas = ["nao", "não", "no"]
+            preferidas = ["nao", "n?o", "não", "no"]
+            exige_preferida = True
+        elif any(k in ctx for k in ["shift", "schedule", "horario", "horário", "turno", "escala",
+                                    "sunday", "monday", "tuesday", "wednesday", "thursday",
+                                    "friday", "saturday", "domingo", "lunes", "martes",
+                                    "miercoles", "miércoles", "jueves", "viernes", "sabado",
+                                    "sábado", "am", "pm"]):
+            aceita = True
+            if any(k in ctx for k in ["sunday", "domingo", "saturday", "sabado", "sábado", "weekend", "fim de semana"]):
+                aceita = bool(self.perfil.get("aceita_fim_de_semana", True))
+            if any(k in ctx for k in ["12:00 am", "00:00", "madrugada", "overnight", "6:00 am", "06:00"]):
+                aceita = aceita and bool(self.perfil.get("aceita_madrugada", True))
+            if any(k in ctx for k in ["shift", "turno", "escala"]):
+                aceita = aceita and bool(self.perfil.get("aceita_turnos", True))
+            preferidas = ["yes", "sim", "si", "s?", "sí", "aceito", "agree", "concordo"] if aceita else ["no", "nao", "n?o", "não"]
             exige_preferida = True
         elif any(k in ctx for k in ["rh", "recursos humanos", "financeiro", "fiscal",
                                         "controladoria", "contabil", "folha de pagamento",
                                         "sap business", "s/4hana", "s4hana", "business one"]):
-            preferidas = ["nao", "não", "no"]
+            preferidas = ["nao", "n?o", "não", "no"]
             exige_preferida = True
         elif any(k in ctx for k in ["possui", "experiencia", "experience", "tem conhecimento", "conhecimento", "atuou", "trabalhou"]):
-            preferidas = ["sim", "yes", "si", "tenho", "possuo"]
+            if self._contexto_menciona_perfil(ctx):
+                preferidas = ["sim", "yes", "si", "tenho", "possuo"]
+            else:
+                preferidas = ["nao", "n?o", "não", "no"]
             exige_preferida = True
         elif any(k in ctx for k in ["ingles", "english", "spoken english", "autorizado", "authorized", "eligible", "lawfully"]):
             preferidas = ["yes", "sim", "si", "avancado", "advanced", "c1", "c2"]
@@ -1443,18 +2020,55 @@ class AgenteLinkedIn:
         if exige_preferida:
             return None
         for original, normalizada in normalizadas:
-            if normalizada not in ("selecionar opcao", "selecciona una opcion", "select an option", "selecione", "select"):
+            if normalizada not in ("selecionar opcao", "selecciona una opcion", "selecciona una opci?n", "selecciona una opción", "select an option", "selecione", "select"):
                 return original
         return None
 
+    def _texto_perfil_para_busca(self) -> str:
+        partes: list[str] = []
+
+        def coletar(valor) -> None:
+            if valor in (None, ""):
+                return
+            if isinstance(valor, dict):
+                for item in valor.values():
+                    coletar(item)
+                return
+            if isinstance(valor, list):
+                for item in valor:
+                    coletar(item)
+                return
+            partes.append(str(valor))
+
+        coletar(self.perfil)
+        return self._normalizar_texto(" ".join(partes))
+
+    def _contexto_menciona_perfil(self, ctx: str) -> bool:
+        perfil_texto = self._texto_perfil_para_busca()
+        tokens_ctx = [
+            token.strip(".,;:!?()[]{}")
+            for token in ctx.split()
+            if len(token.strip(".,;:!?()[]{}")) >= 3
+        ]
+        termos_ignorados = {
+            "voce", "você", "possui", "experiencia", "experience", "conhecimento",
+            "trabalhou", "atuou", "curso", "cursos", "certificado", "certificacao",
+            "certificaçao", "certificação", "senior", "pleno", "junior", "anos",
+        }
+        for token in tokens_ctx:
+            if token in termos_ignorados:
+                continue
+            if token in perfil_texto:
+                return True
+        return False
+
     def _pergunta_sobre_tecnologia_fora_do_perfil(self, ctx: str) -> bool:
-        if not any(k in ctx for k in ["possui", "experiencia", "experience", "conhecimento", "atuou", "trabalhou"]):
+        if not any(k in ctx for k in ["possui", "experiencia", "experience", "conhecimento", "atuou", "trabalhou", "modulos", "módulos"]):
             return False
-        tecnologias_perfil = " ".join(str(t) for t in self.perfil.get("tecnologias", []))
-        tecnologias_perfil = self._normalizar_texto(tecnologias_perfil)
+        perfil_texto = self._texto_perfil_para_busca()
         for termo in TECNOLOGIAS_ESPECIFICAS:
             termo_norm = self._normalizar_texto(termo)
-            if termo_norm in ctx and termo_norm not in tecnologias_perfil:
+            if termo_norm in ctx and termo_norm not in perfil_texto:
                 return True
         return False
 
@@ -1464,23 +2078,45 @@ class AgenteLinkedIn:
             selects = await modal.locator("select").all()
             if selects:
                 self.log(f"Preenchendo {len(selects)} select(s) no modal...")
+            _placeholder_texts = (
+                "selecionar opcao", "selecionar op", "selecciona una opcion",
+                "select an option", "selecione", "select", "",
+            )
             for s in selects:
                 try:
-                    # Pula se já tem valor selecionado
-                    atual = await s.input_value()
-                    if atual and atual not in ("", "null", "undefined"):
-                        continue
+                    # Verifica se a opção selecionada ainda é placeholder (pelo texto, não pelo value)
+                    texto_selecionado = await s.evaluate(
+                        "el => el.options[el.selectedIndex] ? el.options[el.selectedIndex].text.trim() : ''"
+                    )
+                    texto_norm = self._normalizar_texto(texto_selecionado)
+                    if texto_norm and not any(p in texto_norm for p in _placeholder_texts):
+                        continue  # já tem valor real selecionado
                     # Usa JS para ler opções — mais confiável que locator("option")
                     opcoes_raw = await s.evaluate(
                         "el => Array.from(el.options).map(o => o.text.trim())"
                     )
                     opcoes = [o for o in opcoes_raw if o]
+                    # LinkedIn pode não popular opções até interação — tenta clicar para carregar
                     if not opcoes:
+                        try:
+                            await s.click(timeout=1500)
+                            await asyncio.sleep(0.4)
+                            await s.press("Escape")
+                            await asyncio.sleep(0.2)
+                            opcoes_raw = await s.evaluate(
+                                "el => Array.from(el.options).map(o => o.text.trim())"
+                            )
+                            opcoes = [o for o in opcoes_raw if o]
+                        except Exception:
+                            pass
+                    if not opcoes:
+                        self.log(f"Select sem opcoes visíveis mesmo apos clique — pulando.")
                         continue
                     ctx = self._normalizar_texto(await self._contexto_do_campo(s))
-                    preferida = self._opcao_para_contexto(ctx, opcoes)
+                    decisao = await self.orquestrador.escolher_opcao(ctx, opcoes)
+                    preferida = decisao.valor if decisao.acao == "selecionar_opcao" else None
                     if preferida:
-                        self.log(f"Select [{ctx[:40]}] → '{preferida}'")
+                        self.log(f"Orquestrador select ({decisao.origem}/{decisao.confianca}) [{ctx[:40]}] -> '{preferida}'")
                         try:
                             await s.select_option(label=preferida)
                         except Exception:
@@ -1517,12 +2153,14 @@ class AgenteLinkedIn:
                     placeholder_dropdown = (
                         "selecionar opcao",
                         "selecciona una opcion",
+                        "selecciona una opci?n",
+                        "selecciona una opción",
                         "select an option",
                         "selecione uma opcao",
                     )
                     if not any(p in texto_botao_norm for p in placeholder_dropdown):
                         continue
-                    contexto_botao = await self._contexto_do_campo(botao)
+                    contexto_botao = await self._contexto_dropdown(botao)
                     rotulo = self._normalizar_texto(
                         f"{texto_botao} "
                         f"{aria_botao} "
@@ -1533,7 +2171,7 @@ class AgenteLinkedIn:
                         continue
                     if any(k in aria_botao_norm for k in ["email", "e-mail", "codigo do pais", "country code"]):
                         continue
-                    ctx = self._normalizar_texto(contexto_botao)
+                    ctx = self._normalizar_texto(f"{rotulo} {contexto_botao}")
                     await self._click_assistido(botao, "dropdown de pergunta", timeout=4000)
                     await asyncio.sleep(0.8)
                     opcoes = self._page.locator(
@@ -1559,8 +2197,10 @@ class AgenteLinkedIn:
                                     itens.append(item)
                         except Exception:
                             continue
-                    escolhida = self._opcao_para_contexto(ctx, textos)
+                    decisao = await self.orquestrador.escolher_opcao(ctx, textos)
+                    escolhida = decisao.valor if decisao.acao == "selecionar_opcao" else None
                     if escolhida:
+                        self.log(f"Orquestrador dropdown ({decisao.origem}/{decisao.confianca}) [{ctx[:40]}] -> '{escolhida}'")
                         for texto, item in zip(textos, itens):
                             if texto == escolhida:
                                 await self._click_assistido(item, f"opcao {escolhida}", timeout=4000)
@@ -1579,6 +2219,10 @@ class AgenteLinkedIn:
             "agentes de IA, automacoes e solucoes de infraestrutura em producao. "
             "Tenho forte interesse na oportunidade por estar alinhada a minha trajetoria."
         )
+
+    def _pausar_para_revisao(self, motivo: str) -> None:
+        self.estado.erro_atual = motivo
+        self.log(f"PULANDO VAGA: {motivo}")
 
     async def _fechar_modal(self) -> None:
         if not self._page:

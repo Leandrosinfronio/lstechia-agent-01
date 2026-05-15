@@ -12,6 +12,10 @@
   "site": "https://www.lstechia.com.br/",
   "portfolio": "https://www.lstechia.com.br/",
   "disponibilidade": "Imediata",
+  "disponibilidade_horario": "Disponivel para horario comercial, turnos e escalas conforme necessidade da vaga.",
+  "aceita_turnos": true,
+  "aceita_madrugada": true,
+  "aceita_fim_de_semana": true,
   "modelo_trabalho": "Remoto, hibrido ou presencial",
   "areas": [
     "Inteligencia Artificial",
@@ -27,6 +31,17 @@
     "AWS",
     "Azure",
     "Linux"
+  ],
+  "certificacoes": [
+    "Exemplo: AWS Cloud Practitioner",
+    "Exemplo: Microsoft Azure Fundamentals"
+  ],
+  "cursos": [
+    "Exemplo: Python",
+    "Exemplo: Cyber Security"
+  ],
+  "formacao": [
+    "Exemplo: Analise e Desenvolvimento de Sistemas"
   ],
   "curriculos": {
     "ia": {

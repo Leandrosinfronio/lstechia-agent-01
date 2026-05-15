@@ -55,6 +55,37 @@
       margin-top: 4px; word-break: break-word;
     }
     .controls { margin-bottom: 18px; display: flex; flex-wrap: wrap; gap: 10px; }
+    .cost-panel {
+      background: var(--bg); border: 1px solid #334155;
+      border-radius: 10px; padding: 14px; margin-bottom: 18px;
+    }
+    .cost-head {
+      display: flex; justify-content: space-between; gap: 12px; align-items: center;
+      margin-bottom: 12px;
+    }
+    .cost-title { color: var(--accent); font-size: 16px; font-weight: 800; }
+    .cost-note { color: var(--muted); font-size: 12px; }
+    .cost-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 10px; margin-bottom: 12px;
+    }
+    .toggle-row, .input-row {
+      border: 1px solid #1f2f46; border-radius: 8px;
+      padding: 10px; background: #030817;
+    }
+    .toggle-row label {
+      display: flex; gap: 10px; align-items: center; font-weight: 700;
+    }
+    .toggle-row input { width: 18px; height: 18px; accent-color: var(--accent); }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 5px; line-height: 1.35; }
+    .input-row label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    .input-row input {
+      width: 100%; background: #020617; color: var(--text);
+      border: 1px solid #334155; border-radius: 8px;
+      padding: 10px; font-size: 14px;
+    }
+    .btn-save { background: #0ea5e9; color: white; padding: 11px 16px; }
+    .save-status { color: var(--muted); font-size: 13px; margin-left: 8px; }
     button {
       padding: 14px 22px; border: none; border-radius: 10px;
       font-size: 15px; font-weight: 700; cursor: pointer;
@@ -105,6 +136,53 @@
       <button class="btn-warn" id="btn-forca" onclick="forcar()">FORCAR PARADA</button>
     </div>
 
+    <div class="cost-panel">
+      <div class="cost-head">
+        <div>
+          <div class="cost-title">Controles de IA e custo</div>
+          <div class="cost-note">Altere com o agente desligado. Salario de mercado usa API e pode gerar custo.</div>
+        </div>
+        <div>
+          <button class="btn-save" id="btn-salvar-config" onclick="salvarConfig()">SALVAR CONTROLES</button>
+          <span class="save-status" id="config-status"></span>
+        </div>
+      </div>
+      <div class="cost-grid">
+        <div class="toggle-row">
+          <label><input type="checkbox" id="cfg-openai"> Usar OpenAI</label>
+          <div class="hint">Responde perguntas, avalia vagas e pode estimar salario.</div>
+        </div>
+        <div class="toggle-row">
+          <label><input type="checkbox" id="cfg-salario-mercado"> Salario por mercado</label>
+          <div class="hint">Quando ativo, estima salario pela IA antes de usar o piso.</div>
+        </div>
+        <div class="toggle-row">
+          <label><input type="checkbox" id="cfg-serper-salario"> Buscar salario no Serper</label>
+          <div class="hint">Usa creditos do Serper. Ligue so quando quiser consultar mercado.</div>
+        </div>
+        <div class="toggle-row">
+          <label><input type="checkbox" id="cfg-groq"> Usar Groq</label>
+          <div class="hint">Fallback opcional. Deixe desligado para evitar custo.</div>
+        </div>
+        <div class="toggle-row">
+          <label><input type="checkbox" id="cfg-ollama"> Usar Ollama</label>
+          <div class="hint">Modelo local. Sem custo de API, se estiver instalado.</div>
+        </div>
+        <div class="input-row">
+          <label for="cfg-piso-clt">Piso CLT mensal (BRL)</label>
+          <input type="number" id="cfg-piso-clt" min="0" step="100">
+        </div>
+        <div class="input-row">
+          <label for="cfg-piso-pj">Piso PJ mensal (BRL)</label>
+          <input type="number" id="cfg-piso-pj" min="0" step="100">
+        </div>
+        <div class="input-row">
+          <label for="cfg-piso-usd">Piso USD mensal</label>
+          <input type="number" id="cfg-piso-usd" min="0" step="50">
+        </div>
+      </div>
+    </div>
+
     <div class="erro" id="erro"></div>
 
     <h2>Logs</h2>
@@ -126,6 +204,59 @@
       if (modo === 'parado')     { ligar.disabled = false; desl.disabled = true;  forca.disabled = true;  }
     }
 
+    function setConfigDisabled(disabled) {
+      [
+        'cfg-openai', 'cfg-salario-mercado', 'cfg-groq', 'cfg-ollama',
+        'cfg-serper-salario', 'cfg-piso-clt', 'cfg-piso-pj', 'cfg-piso-usd', 'btn-salvar-config'
+      ].forEach(id => { document.getElementById(id).disabled = disabled; });
+    }
+
+    async function carregarConfig() {
+      try {
+        const resp = await fetch('/config', { cache: 'no-store' });
+        const cfg = await resp.json();
+        document.getElementById('cfg-openai').checked = !!cfg.usar_openai;
+        document.getElementById('cfg-salario-mercado').checked = !!cfg.salario_mercado_auto;
+        document.getElementById('cfg-serper-salario').checked = !!cfg.usar_serper_salario;
+        document.getElementById('cfg-groq').checked = !!cfg.usar_groq;
+        document.getElementById('cfg-ollama').checked = !!cfg.usar_ollama;
+        document.getElementById('cfg-piso-clt').value = cfg.salario_piso_clt ?? 8000;
+        document.getElementById('cfg-piso-pj').value = cfg.salario_piso_pj ?? 8500;
+        document.getElementById('cfg-piso-usd').value = cfg.salario_piso_usd ?? 1600;
+      } catch(e) {}
+    }
+
+    async function salvarConfig() {
+      const status = document.getElementById('config-status');
+      status.textContent = 'Salvando...';
+      const payload = {
+        usar_openai: document.getElementById('cfg-openai').checked,
+        salario_mercado_auto: document.getElementById('cfg-salario-mercado').checked,
+        usar_serper_salario: document.getElementById('cfg-serper-salario').checked,
+        usar_groq: document.getElementById('cfg-groq').checked,
+        usar_ollama: document.getElementById('cfg-ollama').checked,
+        salario_piso_clt: Number(document.getElementById('cfg-piso-clt').value || 0),
+        salario_piso_pj: Number(document.getElementById('cfg-piso-pj').value || 0),
+        salario_piso_usd: Number(document.getElementById('cfg-piso-usd').value || 0)
+      };
+      try {
+        const resp = await fetch('/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) {
+          status.textContent = data.status || 'Nao foi possivel salvar.';
+          return;
+        }
+        status.textContent = 'Salvo.';
+        setTimeout(() => { if (status.textContent === 'Salvo.') status.textContent = ''; }, 2500);
+      } catch(e) {
+        status.textContent = 'Erro ao salvar.';
+      }
+    }
+
     async function atualizar() {
       try {
         const opts = { cache: 'no-store' };
@@ -143,6 +274,7 @@
         if (parando)      { dot.className = 'dot warn'; lbl.textContent = 'DESLIGANDO...'; setEstadoBotoes('desligando'); }
         else if (rodando) { dot.className = 'dot on';   lbl.textContent = 'RODANDO';       setEstadoBotoes('rodando'); }
         else              { dot.className = 'dot';      lbl.textContent = 'DESLIGADO';     setEstadoBotoes('parado'); }
+        setConfigDisabled(!!rodando || !!parando);
         document.getElementById('s-cand').textContent  = est.candidaturas_enviadas ?? 0;
         document.getElementById('s-anal').textContent  = est.vagas_analisadas ?? 0;
         document.getElementById('s-total').textContent = est.total_aplicadas_persistente ?? 0;
@@ -153,6 +285,7 @@
       } catch(e) {}
     }
     setInterval(atualizar, 1000);
+    carregarConfig();
     atualizar();
   </script>
 </body>
